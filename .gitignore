@@ -9,6 +9,7 @@
 keys/
 *.key
 *.pem
+dashboard_password*.json
 
 # Your memories, databases, downloaded models, logs and lock files
 memory_store/

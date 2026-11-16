@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memoria</title>
+  <link rel="stylesheet" href="/dashboard/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>Memoria</h1>
+        <p class="tagline">Memory for your AI agents</p>
+      </div>
+    </div>
+    <button id="logout" class="btn ghost" hidden>Log out</button>
+  </header>
+
+  <!-- Login -->
+  <main id="login-view" class="center" hidden>
+    <form id="login-form" class="card login-card">
+      <h2>Welcome back</h2>
+      <p class="muted" id="login-hint">Enter your dashboard password.</p>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <button class="btn primary wide" type="submit">Log in</button>
+    </form>
+  </main>
+
+  <!-- Memories -->
+  <main id="app-view" hidden>
+    <section class="toolbar">
+      <div class="search">
+        <input id="search" type="search" placeholder="Search notes, reasons, topics, agents…" aria-label="Search memories">
+      </div>
+      <select id="filter-agent" aria-label="Filter by agent"></select>
+      <select id="filter-topic" aria-label="Filter by topic"></select>
+      <select id="filter-verified" aria-label="Filter by verified status">
+        <option value="">Any status</option>
+        <option value="verified">Verified only</option>
+        <option value="NOT verified">NOT verified only</option>
+      </select>
+    </section>
+    <p class="count" id="count"></p>
+    <ul id="list" class="list"></ul>
+    <p id="empty" class="empty" hidden>No memories match your search.</p>
+  </main>
+
+  <!-- Memory details -->
+  <dialog id="detail" class="sheet" aria-labelledby="detail-title">
+    <div class="sheet-head">
+      <h2 id="detail-title">Memory</h2>
+      <button class="icon-btn" data-close aria-label="Close">✕</button>
+    </div>
+    <div id="detail-body" class="sheet-body"></div>
+  </dialog>
+
+  <!-- Are you sure? -->
+  <dialog id="confirm" class="confirm" aria-labelledby="confirm-title">
+    <h2 id="confirm-title">Delete this memory?</h2>
+    <p id="confirm-text" class="muted"></p>
+    <div class="row end">
+      <button class="btn ghost" id="confirm-no">Cancel</button>
+      <button class="btn danger" id="confirm-yes">Yes, delete it</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

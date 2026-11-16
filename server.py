@@ -11,6 +11,10 @@ where the login pass is made with the agent's secret key (see identity.py and
 make_token.py). Requests without a valid pass are refused with "401". Any agent
 name the request claims for itself is ignored; only the proven ID is used.
 
+The same server also serves the dashboard webpage at
+    http://127.0.0.1:8765/dashboard
+which has its own password (see dashboard.py).
+
 Start it with start_memoria.bat (or: .venv\\Scripts\\python.exe server.py).
 """
 import json
@@ -22,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
+import dashboard  # noqa: E402
 import identity  # noqa: E402
 import memoria  # noqa: E402
 
@@ -166,5 +171,13 @@ if __name__ == "__main__":
     print(f"Memoria is running at http://{HOST}:{PORT}/mcp  (close this window to stop it)",
           file=sys.stderr)
     import uvicorn
-    uvicorn.run(LoginCheck(mcp.streamable_http_app(host=HOST)), host=HOST, port=PORT,
-                log_level="warning")
+
+    agents_app = LoginCheck(mcp.streamable_http_app(host=HOST))
+
+    async def memoria_app(scope, receive, send):
+        """Send dashboard addresses to the dashboard, everything else to the agents' server."""
+        if scope["type"] == "http" and dashboard.handles(scope["path"]):
+            return await dashboard.app(scope, receive, send)
+        return await agents_app(scope, receive, send)
+
+    uvicorn.run(memoria_app, host=HOST, port=PORT, log_level="warning")
