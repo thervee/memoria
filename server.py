@@ -139,13 +139,21 @@ class LoginCheck:
             return await _refuse(send, 401, "unauthorized", str(e),
                                  [(b"www-authenticate", b"Bearer")])
 
-        # 4. Spam protection: too many requests from this agent?
+        # 4. Spam protection: too many requests from this agent, or from its whole account?
+        #    Both are checked before either is counted, so a refused request uses up nothing.
         account_limits = accounts.limits(account)
         if account_limits:
-            wait = limits.per_agent.allow(identity.principal(account, agent_id),
-                                          account_limits["requests_per_minute"])
+            who = identity.principal(account, agent_id)
+            wait = limits.per_agent.blocked_for(who, account_limits["requests_per_minute"])
             if wait:
                 return await _too_many(send, wait, "This agent is sending too many requests.")
+            wait = limits.per_account.blocked_for(
+                account, account_limits["account_requests_per_minute"])
+            if wait:
+                return await _too_many(send, wait, "This account's agents are sending too many "
+                                                   "requests between them.")
+            limits.per_agent.hit(who)
+            limits.per_account.hit(account)
 
         # 5. Pass the PROVEN identity on to the tools.
         scope = dict(scope, headers=headers + [(AGENT_HEADER.encode(), agent_id.encode()),
