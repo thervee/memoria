@@ -4,6 +4,7 @@ Used by the server to slow down anyone sending too many requests:
   - per internet address (IP): every request, before checking any key
   - per internet address: wrong API keys or login passes (stops key guessing)
   - per agent: requests with a valid key (each account's requests_per_minute)
+  - per account: all of an account's agents together (account_requests_per_minute)
   - per internet address and overall: sign-ups
 
 The counts are kept in memory, so they start again when Memoria restarts. That's
@@ -68,6 +69,7 @@ class Window:
 per_ip = Window(_setting("MEMORIA_IP_LIMIT", 120), 60)              # requests per minute
 failed_logins = Window(_setting("MEMORIA_FAILED_LOGIN_LIMIT", 10), 600)  # per 10 minutes
 per_agent = Window(60, 60)  # the real limit comes from each account (requests_per_minute)
+per_account = Window(120, 60)  # likewise (account_requests_per_minute)
 signups_per_ip = Window(_setting("MEMORIA_SIGNUPS_PER_IP", 3), 3600)     # per hour
 signups_total = Window(_setting("MEMORIA_SIGNUPS_PER_DAY", 50), 86400)   # per day, everyone
 MAX_REQUEST_BYTES = _setting("MEMORIA_MAX_REQUEST_BYTES", 64_000)
@@ -103,5 +105,5 @@ def is_this_computer(ip: str) -> bool:
 
 
 def reset_all() -> None:
-    for window in (per_ip, failed_logins, per_agent, signups_per_ip, signups_total):
+    for window in (per_ip, failed_logins, per_agent, per_account, signups_per_ip, signups_total):
         window.reset()

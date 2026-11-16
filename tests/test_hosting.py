@@ -214,6 +214,41 @@ def test_each_agent_is_limited_per_minute(devs):
     assert call(bearer(devs["acme/analyst"]))[0] is None  # other agents unaffected
 
 
+def test_each_account_is_limited_per_minute_across_its_agents(devs):
+    accounts.set_limit("acme", "account_requests_per_minute", 3)
+    statuses = [call(bearer(devs["acme/trader"]))[0], call(bearer(devs["acme/trader"]))[0],
+                call(bearer(devs["acme/analyst"]))[0], call(bearer(devs["acme/analyst"]))[0]]
+    assert statuses == [None, None, None, 429]  # 3 between them, though each agent is under 60
+    _, _, sent, _ = call(bearer(devs["acme/trader"]))
+    assert dict(sent[0]["headers"])[b"retry-after"]
+    assert b"account's agents" in sent[1]["body"]
+    assert call(bearer(devs["globex/trader"]))[0] is None  # other accounts unaffected
+
+
+def test_refused_requests_dont_use_up_the_other_limit(devs):
+    accounts.set_limit("acme", "requests_per_minute", 2)
+    accounts.set_limit("acme", "account_requests_per_minute", 3)
+    trader = [call(bearer(devs["acme/trader"]))[0] for _ in range(4)]
+    assert trader == [None, None, 429, 429]  # the trader's own limit
+    # The trader's refused requests weren't counted for the account: 1 more is still allowed.
+    analyst = [call(bearer(devs["acme/analyst"]))[0] for _ in range(2)]
+    assert analyst == [None, 429]
+
+
+def test_account_limit_has_a_default_and_can_be_changed(devs, capsys):
+    import manage_accounts
+    assert accounts.limits("acme")["account_requests_per_minute"] == 120
+    manage_accounts.main(["set-limit", "acme", "account_requests_per_minute", "500"])
+    assert accounts.limits("acme")["account_requests_per_minute"] == 500
+    manage_accounts.main(["list"])
+    assert "500 per account" in capsys.readouterr().out
+
+
+def test_this_laptops_agents_have_no_account_limit(keys):
+    token = identity.make_token("alice")
+    assert all(call(bearer(token), ip="127.0.0.1")[0] is None for _ in range(130))
+
+
 def test_each_address_is_limited_per_minute(devs, monkeypatch):
     monkeypatch.setattr(limits.per_ip, "limit", 5)
     statuses = [call(bearer(devs["acme/trader"]), ip="198.51.100.1")[0] for _ in range(6)]

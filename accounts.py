@@ -34,7 +34,8 @@ KEY_PREFIX = "mem_"
 
 # Spam protection: what each developer account may do, unless changed per account.
 DEFAULT_LIMITS = {
-    "requests_per_minute": 60,     # per API key
+    "requests_per_minute": 60,     # per agent
+    "account_requests_per_minute": 120,  # all of the account's agents together
     "writes_per_day": 200,         # saves + updates (each one costs AI processing)
     "max_memories": 2000,          # memories kept at once
     "max_agents": 10,              # agents (and so API keys in use) per account

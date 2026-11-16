@@ -191,6 +191,7 @@ your agents are in the built-in account `local` and log in with login passes as 
 | What | Default | Change it |
 |---|---|---|
 | Requests per minute, per agent | 60 | `set-limit <account> requests_per_minute <n>` |
+| Requests per minute, per account (all its agents together) | 120 | `set-limit <account> account_requests_per_minute <n>` |
 | Saves + updates per day, per account (each costs AI processing) | 200 | `set-limit <account> writes_per_day <n>` |
 | Memories kept, per account | 2,000 | `set-limit <account> max_memories <n>` |
 | Agents per account | 10 | `set-limit <account> max_agents <n>` |
@@ -255,7 +256,7 @@ database in a single file, built into Python, with nothing to install or run).
   `manage_accounts.py`. To look inside, any SQLite viewer works (e.g. "DB Browser for SQLite").
 
 ## Tests
-174 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+178 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
 who may delete, connecting agents (the bridge and Python helper), the background worker (including
 retries after failures), backups and restoring them, the dashboard's safety checks, and hosting:
 developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up,

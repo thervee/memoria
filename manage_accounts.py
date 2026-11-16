@@ -12,7 +12,8 @@
     python manage_accounts.py disable <account>             turn an account off
     python manage_accounts.py enable <account>              turn it back on
     python manage_accounts.py set-limit <account> <limit> <number|default>
-        Limits: requests_per_minute, writes_per_day, max_memories, max_agents
+        Limits: requests_per_minute, account_requests_per_minute, writes_per_day,
+                max_memories, max_agents
     python manage_accounts.py invite                        make a one-time invite code
                                                             (for MEMORIA_SIGNUP=invite)
 
@@ -44,7 +45,8 @@ def show_list() -> None:
         print(f"{account}  [{info['status']}]  {info.get('name') or ''} {info.get('email') or ''}")
         print(f"    memories: {db.count_memories(account)} of {limit['max_memories']}   "
               f"writes today: {db.writes_today(account, today)} of {limit['writes_per_day']}   "
-              f"requests/minute: {limit['requests_per_minute']}")
+              f"requests/minute: {limit['requests_per_minute']} per agent, "
+              f"{limit['account_requests_per_minute']} per account")
         for key in accounts.keys_of(account):
             state = f"revoked {key['revoked_at']}" if key["revoked_at"] else "active"
             print(f"    key {key['key_id']}  agent '{key['agent']}'  {state}")
