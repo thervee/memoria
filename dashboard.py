@@ -1,21 +1,20 @@
-"""Memoria dashboard: a password-protected web page for managing memories.
+"""Memoria dashboard: a web page for managing memories.
 
 Served by the Memoria server itself at http://127.0.0.1:8765/dashboard
-(only this laptop can open it).
+It opens straight away, with no password.
 
 Safety rules:
-  - The password is never stored, only a salted scrypt hash, in
-    keys/dashboard_password.json (git-ignored, readable only by your Windows account).
-  - After logging in, the browser gets a random session cookie (12 hours).
-  - Requests must come to 127.0.0.1/localhost, and changes must come from
-    the dashboard page itself, so other websites can't use it behind your back.
+  - Only this laptop can reach it: Memoria listens on 127.0.0.1 only, and
+    requests must be addressed to 127.0.0.1 or localhost (this also blocks
+    "DNS rebinding" tricks by other websites).
+  - Changes (sharing, delete) are only accepted from the dashboard page itself:
+    the browser's Origin and Sec-Fetch-Site headers must say so. Other websites
+    can't make changes behind your back, and they can't read your memories either,
+    because browsers don't hand them the answers.
   - Sharing changes and deletions are made AS the agent that wrote the memory,
     proven with that agent's own key, the same rule agents follow.
 """
-import asyncio
 import json
-import secrets
-import time
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -23,7 +22,6 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
-import dashboard_password as password_store
 import identity
 import memoria
 
@@ -32,11 +30,6 @@ PAGE_DIR = HERE / "dashboard"
 PORT = 8765
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
-COOKIE = "memoria_session"
-SESSION_SECONDS = 12 * 3600
-
-_sessions: dict[str, float] = {}   # session cookie -> expiry time
-_failed_logins: list[float] = []   # times of recent wrong passwords
 
 
 # ---------- request checks ----------
@@ -45,22 +38,15 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": True, "message": message}, status_code=status)
 
 
-def _logged_in(request: Request) -> bool:
-    expiry = _sessions.get(request.cookies.get(COOKIE, ""))
-    if expiry and expiry > time.time():
-        return True
-    _sessions.pop(request.cookies.get(COOKIE, ""), None)
-    return False
-
-
-def _guard(request: Request, need_login: bool = True) -> JSONResponse | None:
+def _guard(request: Request) -> JSONResponse | None:
     """Return an error response if this request isn't allowed, else None."""
     if request.headers.get("host", "") not in ALLOWED_HOSTS:
         return _error(403, "Open the dashboard at http://127.0.0.1:8765/dashboard")
-    if request.method != "GET" and request.headers.get("origin") not in ALLOWED_ORIGINS:
-        return _error(403, "Changes are only accepted from the Memoria dashboard page.")
-    if need_login and not _logged_in(request):
-        return _error(401, "Please log in.")
+    if request.method != "GET":
+        fetch_site = request.headers.get("sec-fetch-site")
+        if (request.headers.get("origin") not in ALLOWED_ORIGINS
+                or (fetch_site is not None and fetch_site != "same-origin")):
+            return _error(403, "Changes are only accepted from the Memoria dashboard page.")
     return None
 
 
@@ -94,7 +80,7 @@ def _act_as_author(memory_id: str) -> str:
 
 def _static(name: str, media_type: str):
     async def handler(request: Request):
-        blocked = _guard(request, need_login=False)
+        blocked = _guard(request)
         if blocked:
             return blocked
         return FileResponse(PAGE_DIR / name, media_type=media_type,
@@ -104,48 +90,6 @@ def _static(name: str, media_type: str):
 
 async def home(request: Request):
     return RedirectResponse("/dashboard")
-
-
-async def session(request: Request):
-    blocked = _guard(request, need_login=False)
-    return blocked or JSONResponse({"logged_in": _logged_in(request),
-                                    "password_set": password_store.is_set()})
-
-
-async def login(request: Request):
-    blocked = _guard(request, need_login=False)
-    if blocked:
-        return blocked
-    now = time.time()
-    _failed_logins[:] = [t for t in _failed_logins if now - t < 60]
-    if len(_failed_logins) >= 5:
-        return _error(429, "Too many wrong passwords. Wait a minute and try again.")
-    if not password_store.is_set():
-        return _error(400, "No password set yet. Double-click set_dashboard_password.bat first.")
-    try:
-        password = str((await _json_body(request)).get("password", ""))
-    except ValueError as e:
-        return _error(400, str(e))
-    if not await asyncio.to_thread(password_store.check, password):
-        _failed_logins.append(now)
-        await asyncio.sleep(1)  # slow down guessing
-        return _error(401, "Wrong password.")
-    token = secrets.token_urlsafe(32)
-    _sessions[token] = now + SESSION_SECONDS
-    response = JSONResponse({"logged_in": True})
-    response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True,
-                        samesite="strict", path="/dashboard")
-    return response
-
-
-async def logout(request: Request):
-    blocked = _guard(request, need_login=False)
-    if blocked:
-        return blocked
-    _sessions.pop(request.cookies.get(COOKIE, ""), None)
-    response = JSONResponse({"logged_in": False})
-    response.delete_cookie(COOKIE, path="/dashboard")
-    return response
 
 
 async def list_memories(request: Request):
@@ -206,9 +150,6 @@ _app = Starlette(routes=[
     Route("/dashboard/", home),
     Route("/dashboard/app.css", _static("app.css", "text/css")),
     Route("/dashboard/app.js", _static("app.js", "text/javascript")),
-    Route("/dashboard/api/session", session),
-    Route("/dashboard/api/login", login, methods=["POST"]),
-    Route("/dashboard/api/logout", logout, methods=["POST"]),
     Route("/dashboard/api/memories", list_memories),
     Route("/dashboard/api/memories/{memory_id}", memory_detail),
     Route("/dashboard/api/memories/{memory_id}/sharing", change_sharing, methods=["POST"]),

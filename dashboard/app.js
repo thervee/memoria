@@ -30,10 +30,6 @@ async function api(path, body) {
   });
   let data = {};
   try { data = await response.json(); } catch { /* empty reply */ }
-  if (response.status === 401 && path !== "/login") {
-    showLogin();
-    throw new Error("Please log in again.");
-  }
   if (!response.ok) throw new Error(data.message || "Something went wrong.");
   return data;
 }
@@ -61,47 +57,7 @@ const sharingText = (m) => m.visibility === "shared"
   ? "Shared with " + m.shared_with.join(", ")
   : "Private";
 
-// ---------- login ----------
-
-function showLogin(passwordSet = true) {
-  $("#app-view").hidden = true;
-  $("#logout").hidden = true;
-  $("#login-view").hidden = false;
-  $("#login-hint").textContent = passwordSet
-    ? "Enter your dashboard password."
-    : "No password has been set yet. Double-click set_dashboard_password.bat in your memoria folder, then come back.";
-  $("#password").focus();
-}
-
-$("#login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  $("#login-error").textContent = "";
-  const button = event.target.querySelector('button[type="submit"]');
-  button.disabled = true;
-  try {
-    await api("/login", { password: $("#password").value });
-    $("#password").value = "";
-    await showApp();
-  } catch (error) {
-    $("#login-error").textContent = error.message;
-  } finally {
-    button.disabled = false;
-  }
-});
-
-$("#logout").addEventListener("click", async () => {
-  await api("/logout", {});
-  showLogin();
-});
-
 // ---------- the list ----------
-
-async function showApp() {
-  $("#login-view").hidden = true;
-  $("#app-view").hidden = false;
-  $("#logout").hidden = false;
-  await loadMemories();
-}
 
 async function loadMemories() {
   const data = await api("/memories");
@@ -286,12 +242,4 @@ $("#detail").addEventListener("click", (e) => { if (e.target === $("#detail")) $
 
 // ---------- start ----------
 
-(async () => {
-  try {
-    const s = await api("/session");
-    if (s.logged_in) await showApp();
-    else showLogin(s.password_set);
-  } catch (error) {
-    toast(error.message, true);
-  }
-})();
+loadMemories().catch((error) => toast(error.message, true));

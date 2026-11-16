@@ -18,18 +18,18 @@ It's built on [Cognee](https://github.com/topoteretes/cognee) and runs on this l
 3. **Manage memories in your browser** at **http://127.0.0.1:8765/dashboard**. See below.
 
 ## Dashboard
-Open **http://127.0.0.1:8765/dashboard** in your browser. Only this laptop can open it, and it runs
-whenever Memoria runs.
-- **Set or change the password:** double-click `set_dashboard_password.bat` (at least 8 characters).
-  Only a scrambled fingerprint of it is stored, in `keys/dashboard_password.json`, which is never
-  uploaded to GitHub. After changing it, restart Memoria to log out old sessions.
+Open **http://127.0.0.1:8765/dashboard** in your browser (type `http://`, not `https://`).
+It opens straight away, with no password, and runs whenever Memoria runs.
+- **Only this laptop can open it**, and other websites can't make changes behind your back:
+  changes are only accepted from the dashboard page itself.
+- **No password means** anyone using this laptop (and any program running on it) can open the
+  dashboard and see every memory, including agents' private ones.
 - **See everything:** every memory with its topic, note, writer, date, confidence, verified status and sharing.
 - **Search and filter** by any words, agent, topic or verified status.
 - **Click a memory** to see its details, signature and every version in its history.
 - **Change sharing** (private, or shared with chosen agents) and **delete** memories (after an
   "are you sure?" step). Both are done *as the agent that wrote the memory*, using its own key, the
   same rule agents follow, and the activity log marks them `"via": "dashboard"`.
-- You stay logged in for 12 hours. After 5 wrong passwords in a minute, it makes you wait.
 
 ## The tools
 | Tool | What it does |
@@ -89,10 +89,9 @@ protect against someone who already controls Memoria and your Windows account on
 | `identity.py` | Agent keys, login passes and signatures |
 | `register_agent.bat` / `register_agent.py` | Register a new agent (creates its keys) |
 | `make_token.py` | Makes a login pass for an agent (Claude Code runs it automatically) |
-| `dashboard.py` | The dashboard's server side (login, list, history, sharing, delete) |
+| `dashboard.py` | The dashboard's server side (list, history, sharing, delete, and its safety checks) |
 | `dashboard/` | The dashboard webpage (`index.html`, `app.css`, `app.js`) |
-| `dashboard_password.py` / `set_dashboard_password.bat` | Set the dashboard password |
-| `keys/` | **Agents' secret keys**, the public key list and the dashboard password hash. Never shared or uploaded. |
+| `keys/` | **Agents' secret keys** and the public key list. Never shared or uploaded. |
 | `start_memoria.bat` | Double-click to start Memoria |
 | `start_memoria_hidden.vbs` | Starts Memoria with no window (used at Windows login) |
 | `keep_memoria_running.py` | The watchdog that restarts Memoria if it crashes |

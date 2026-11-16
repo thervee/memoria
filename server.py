@@ -13,7 +13,7 @@ name the request claims for itself is ignored; only the proven ID is used.
 
 The same server also serves the dashboard webpage at
     http://127.0.0.1:8765/dashboard
-which has its own password (see dashboard.py).
+which opens without a password but only from this laptop (see dashboard.py).
 
 Start it with start_memoria.bat (or: .venv\\Scripts\\python.exe server.py).
 """
