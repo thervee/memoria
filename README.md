@@ -41,6 +41,16 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
 
+## Saving is instant; processing happens in the background
+Saving, updating and deleting answer straight away. The slow part (Gemini reading the memory and
+Cognee adding it to its knowledge graph, which can take minutes on the free tier) is done afterwards by
+a background worker, one job at a time. Memories that arrive together are processed in one run.
+- While a memory is waiting it shows **processing: true** (⏳ Processing in the dashboard).
+  `find_memory` still finds it, by the words in the question rather than by meaning.
+- If processing fails (for example Gemini is busy), the worker waits and tries again, waiting longer
+  each time (up to 10 minutes). Failures are written to `memory_store\activity.log` as `background_error`.
+- If Memoria stops halfway, nothing is lost: the worker finishes the work the next time Memoria starts.
+
 ## Agent IDs and keys
 Every agent has an ID (lowercase letters, numbers and dashes, e.g. `researcher`) and its own pair of
 Ed25519 keys:
@@ -84,7 +94,8 @@ protect against someone who already controls Memoria and your Windows account on
 |---|---|
 | `.env` | Settings and your Gemini API key. **Keep private.** |
 | `setup_cognee.py` | Points Cognee at local storage |
-| `memoria.py` | The memory engine (save / find / update) |
+| `memoria.py` | The memory engine (save / find / update) and the background worker |
+| `requirements.txt` | Every package Memoria needs, with exact versions |
 | `server.py` | The shared MCP server that gives agents the memory tools (checks every login) |
 | `identity.py` | Agent keys, login passes and signatures |
 | `register_agent.bat` / `register_agent.py` | Register a new agent (creates its keys) |
@@ -99,7 +110,8 @@ protect against someone who already controls Memoria and your Windows account on
 | `memory_store/` | **All your memories.** Back up this folder to keep them safe. |
 | `memory_store/memories.json` | Readable list of every memory, its labels and its history |
 | `memory_store/agents.json` | Every agent ID that has used Memoria |
-| `memory_store/activity.log` | Who saved, searched or updated what, and when |
+| `memory_store/activity.log` | Who saved, searched or updated what, and when (plus any background processing errors) |
+| `memory_store/pending_forget.json` | Deleted memories still waiting to be removed from Cognee's databases |
 
 ## Setup used
 - AI model: Google Gemini `gemini-3.5-flash-lite` (free tier). It processes memories into Cognee's knowledge graph.
