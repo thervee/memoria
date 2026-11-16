@@ -342,7 +342,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
 
 
 async def share_memory(agent_id: str, memory_id: str, visibility: str,
-                       shared_with: list[str] | None = None) -> dict:
+                       shared_with: list[str] | None = None, via: str | None = None) -> dict:
     """Change who can read a memory. Only the agent that wrote it may do this."""
     agent_id = check_agent(agent_id)
     memory_id = _require(memory_id, "memory_id")
@@ -361,5 +361,60 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
         _write_json(INDEX_FILE, index)
     _log(agent_id, "share", memory_id=memory_id,
          before={"visibility": before[0], "shared_with": before[1]},
-         after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]})
+         after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
+         **({"via": via} if via else {}))
     return _public(mem)
+
+
+async def delete_memory(agent_id: str, memory_id: str, via: str | None = None) -> dict:
+    """Delete a memory for good. Only the agent that wrote it may do this."""
+    agent_id = check_agent(agent_id)
+    memory_id = _require(memory_id, "memory_id")
+    async with _write_lock:
+        index = _read_json(INDEX_FILE, {})
+        mem = index.get(memory_id)
+        if mem is None or not can_see(mem, agent_id):
+            raise MemoriaError(f"No memory with ID '{memory_id}'.")
+        if mem["agent_id"] != agent_id:
+            raise MemoriaError(
+                f"Only the agent that wrote this memory ('{mem['agent_id']}') can delete it."
+            )
+        # Remove it from Cognee (text, search index and knowledge graph) first.
+        await cognee.forget(data_id=UUID(mem["data_id"]), dataset_id=UUID(mem["dataset_id"]))
+        del index[memory_id]
+        _write_json(INDEX_FILE, index)
+    _log(agent_id, "delete", memory_id=memory_id, topic=mem["topic"],
+         **({"via": via} if via else {}))
+    return {"deleted": memory_id}
+
+
+# ---------- read-only views for the dashboard (the laptop owner sees everything) ----------
+
+def all_memories() -> list[dict]:
+    """Every memory with its labels and signature check, newest first."""
+    index = _read_json(INDEX_FILE, {})
+    out = [_public(m) for m in index.values()]
+    out.sort(key=lambda m: m["updated_at"] or m["saved_at"], reverse=True)
+    return out
+
+
+def memory_versions(memory_id: str) -> dict | None:
+    """One memory plus every version of it, newest first."""
+    mem = _read_json(INDEX_FILE, {}).get(memory_id)
+    if mem is None:
+        return None
+    versions = []
+    author, written_at = mem["agent_id"], mem["created_at"]
+    for old in mem.get("history", []):
+        versions.append({"note": old["note"], "reason": old["reason"],
+                         "confidence": old["confidence"], "topic": old["topic"],
+                         "written_by": author, "written_at": written_at,
+                         "replaced_by": old["replaced_by"], "replaced_at": old["replaced_at"]})
+        author, written_at = old["replaced_by"], old["replaced_at"]
+    versions.append({"note": mem["note"], "reason": mem["reason"],
+                     "confidence": mem["confidence"], "topic": mem["topic"],
+                     "written_by": author, "written_at": written_at, "current": True})
+    versions.reverse()
+    for number, version in enumerate(versions):
+        version["version"] = len(versions) - number
+    return {**_public(mem), "versions": versions}
