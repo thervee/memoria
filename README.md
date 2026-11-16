@@ -97,6 +97,8 @@ protect against someone who already controls Memoria and your Windows account on
 | `setup_cognee.py` | Points Cognee at local storage |
 | `memoria.py` | The memory engine (save / find / update) and the background worker |
 | `requirements.txt` | Every package Memoria needs, with exact versions |
+| `requirements-dev.txt` | The extra package needed to run the tests (pytest) |
+| `tests/` | The automatic tests (`pytest.ini` holds their settings) |
 | `server.py` | The shared MCP server that gives agents the memory tools (checks every login) |
 | `identity.py` | Agent keys, login passes and signatures |
 | `register_agent.bat` / `register_agent.py` | Register a new agent (creates its keys) |
@@ -113,6 +115,16 @@ protect against someone who already controls Memoria and your Windows account on
 | `memory_store/agents.json` | Every agent ID that has used Memoria |
 | `memory_store/activity.log` | Who saved, searched or updated what, and when (plus any background processing errors) |
 | `memory_store/pending_forget.json` | Deleted memories still waiting to be removed from Cognee's databases |
+
+## Tests
+69 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+who may delete, the background worker (including retries after failures), and the dashboard's
+safety checks. They take a few seconds, use a pretend Cognee (so no Gemini calls), and each one runs
+in its own temporary folder, so they never touch your real memories or keys.
+
+Run them (in PowerShell, in the Memoria folder):
+1. Once: `.venv\Scripts\python.exe -m pip install -r requirements-dev.txt`
+2. Each time: `.venv\Scripts\python.exe -m pytest`
 
 ## Setup used
 - AI model: Google Gemini `gemini-3.5-flash-lite` (free tier). It processes memories into Cognee's knowledge graph.
