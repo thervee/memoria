@@ -30,8 +30,10 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+import paths
+
 HERE = Path(__file__).resolve().parent
-DB_FILE = HERE / "memory_store" / "memoria.db"
+DB_FILE = paths.STORE / "memoria.db"
 SCHEMA_VERSION = 1
 
 SCHEMA = """

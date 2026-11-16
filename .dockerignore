@@ -1,0 +1,23 @@
+# What Docker may see when building the image. Everything is left out except the
+# code, so secrets and data can never end up in the image, even by mistake.
+*
+!requirements.txt
+!*.py
+
+# Never, even if a rule above is changed later (these lines win because they come last):
+.env
+.env.*
+keys
+**/*.key
+**/*.pem
+memory_store
+memory_store.*
+backups
+data
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.venv
+.git
+tests
+**/__pycache__

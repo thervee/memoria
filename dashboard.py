@@ -23,6 +23,8 @@ import json
 import os
 from pathlib import Path
 
+import paths
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse
@@ -178,7 +180,10 @@ async def app(scope, receive, send):
 
 
 def handles(path: str) -> bool:
-    """True for web addresses that belong to the dashboard (none if it's turned off)."""
-    if os.environ.get("MEMORIA_DASHBOARD", "on").strip().lower() == "off":
+    """True for web addresses that belong to the dashboard (none if it's turned off).
+
+    Always off when Memoria runs online: the dashboard shows every account's memories.
+    """
+    if paths.ONLINE or os.environ.get("MEMORIA_DASHBOARD", "on").strip().lower() == "off":
         return False
     return path == "/" or path == "/dashboard" or path.startswith("/dashboard/")

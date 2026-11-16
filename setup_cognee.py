@@ -6,8 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import paths
+
 HERE = Path(__file__).resolve().parent
-STORE = HERE / "memory_store"  # all memories live in this folder
+STORE = paths.STORE  # all memories live in this folder (see paths.py)
 
 # Read the .env file (API key and model choices) before Cognee starts.
 load_dotenv(HERE / ".env", override=True)

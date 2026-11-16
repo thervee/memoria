@@ -11,7 +11,8 @@ downloaded search model, logs and lock files. Memoria's database is copied with
 SQLite's own backup feature, so the copy is consistent even while it's in use.
 
 Settings (optional, in .env):
-  MEMORIA_BACKUP_DIR   where backups go (default: the "backups" folder next to this file).
+  MEMORIA_BACKUP_DIR   where backups go (default: the "backups" folder next to this file,
+                       or in MEMORIA_DATA_DIR when that's set; see paths.py).
                        Point it at a USB drive or another disk to survive a disk failure.
   MEMORIA_BACKUP_KEEP  how many backups to keep (default 14).
 
@@ -25,6 +26,8 @@ import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import paths
 
 HERE = Path(__file__).resolve().parent
 PREFIX = "memoria-backup-"
@@ -44,7 +47,7 @@ class BackupError(RuntimeError):
 
 
 def backup_dir() -> Path:
-    return Path(os.environ.get("MEMORIA_BACKUP_DIR") or HERE / "backups")
+    return Path(os.environ.get("MEMORIA_BACKUP_DIR") or paths.BACKUPS)
 
 
 def keep_count() -> int:

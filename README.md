@@ -107,6 +107,8 @@ protect against someone who already controls Memoria and your Windows account on
 | `setup_cognee.py` | Points Cognee at local storage |
 | `memoria.py` | The memory engine (save / find / update) and the background worker |
 | `db.py` | Memoria's database: where memories, agents and accounts are kept |
+| `paths.py` | Where data is kept (`MEMORIA_DATA_DIR`) and whether Memoria runs online (`MEMORIA_ONLINE`) |
+| `Dockerfile` / `.dockerignore` / `railway.json` | Everything Railway needs to build and run Memoria |
 | `requirements.txt` | Every package Memoria needs, with exact versions |
 | `requirements-dev.txt` | The extra package needed to run the tests (pytest) |
 | `tests/` | The automatic tests (`pytest.ini` holds their settings) |
@@ -225,16 +227,50 @@ made per day in total.
 Memoria runs on. It refuses anything that came through a proxy, and you can turn it off with
 `MEMORIA_DASHBOARD=off`.
 
-**Still to do before going online** (not done yet, on purpose):
-1. Choose a server and run Memoria there behind a web server that adds HTTPS (a "reverse proxy").
-   Set `MEMORIA_TRUST_PROXY=1` so limits use each visitor's real address. Never expose Memoria without
-   HTTPS: API keys would travel in plain sight.
-2. Let Memoria accept connections from the proxy and your web address. It only listens on this computer
-   today (`127.0.0.1`), and the MCP server only accepts requests addressed to `127.0.0.1`.
-3. Make the server secret, set `MEMORIA_DASHBOARD=off`, and keep backups off the server.
-4. Check the Gemini plan: every save costs AI processing, and the free tier won't cover many developers.
-5. Optional: email checks at sign-up, a page where developers manage their own keys, and terms of use
+**Still to do before going online:**
+1. Deploy on Railway (see "Deploying on Railway" below). Railway adds HTTPS, and Memoria is ready for it.
+2. Check the Gemini plan: every save costs AI processing, and the free tier won't cover many developers.
+3. Optional: email checks at sign-up, a page where developers manage their own keys, and terms of use
    and a privacy notice (you'd be storing other people's data).
+
+## Deploying on Railway (ready, not deployed)
+Everything Railway needs is in the repository: `Dockerfile`, `.dockerignore` and `railway.json`.
+On this laptop nothing changes: none of it is used here.
+
+**What the Docker image does**
+- It holds **only code**. The Dockerfile copies the server's Python files one by one, and `.dockerignore`
+  shuts everything else out, so `.env`, `keys`, `memory_store` and `backups` can never get into it.
+- It runs Memoria **online** (`MEMORIA_ONLINE=1`): listening on `0.0.0.0` and Railway's `PORT`, the
+  dashboard off, and visitors' real addresses read from Railway's proxy for the spam limits.
+- It keeps **all data in `/data`** (`MEMORIA_DATA_DIR=/data`), where you mount a Railway volume:
+  `/data/memory_store` (database, Cognee's data, logs), `/data/keys` (agents' locked signing keys) and
+  `/data/backups` (the daily backups).
+- It holds the settings that aren't secret (Gemini model, search model, and so on). **Secrets are not in
+  it**: you add them in Railway.
+- **`/health`** answers `{"status": "ok"}` when Memoria and its database are up. Railway checks it on
+  every deploy.
+- **It refuses to start** if a secret is missing, if no volume is attached, or if `/data` isn't on the
+  volume, and says why in the deploy logs, so it never runs half set up and loses data.
+
+**What to set in Railway** (once)
+1. New project, then deploy this GitHub repository. Railway finds `railway.json` and builds the Dockerfile.
+2. Add a **volume** to the service, mounted at **`/data`**.
+3. Add two **variables**:
+   - `LLM_API_KEY`: your Gemini API key.
+   - `MEMORIA_SECRET_KEY`: run `.venv\Scripts\python.exe manage_accounts.py make-secret` on this laptop
+     and copy the value. Keep a private copy: without it, developers' agents can't sign any more.
+4. In the service's settings, under Networking, **generate a domain**. Agents connect to
+   `https://<that domain>/mcp`.
+5. Optional variables: `MEMORIA_SIGNUP` (`invite` or `open`), and any spam-limit settings from
+   `.env.example`.
+
+**After deploying**
+- Create developer accounts **on the server**: open a shell into the service (`railway ssh` with the
+  Railway command-line tool), then run `python manage_accounts.py create acme` and
+  `python manage_accounts.py new-key acme trader`.
+- Backups are made daily in `/data/backups`, on the same volume. Download one now and then to keep a
+  copy somewhere else.
+- Keep the service at **one replica**: the database is a file on the volume.
 
 ## Database
 Memoria keeps its own records in one database file, `memory_store\memoria.db` (SQLite: a full
@@ -256,12 +292,14 @@ database in a single file, built into Python, with nothing to install or run).
   `manage_accounts.py`. To look inside, any SQLite viewer works (e.g. "DB Browser for SQLite").
 
 ## Tests
-178 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+213 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
 who may delete, connecting agents (the bridge and Python helper), the background worker (including
 retries after failures), backups and restoring them, the dashboard's safety checks, and hosting:
 developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up,
 and the database: importing the older files, surviving restarts, two programs at once, using indexes
-instead of reading everything, and backups never catching a change halfway.
+instead of reading everything, and backups never catching a change halfway; and running online:
+this laptop's settings unchanged, the data folder, the start-up checks, `/health`, what goes into the
+Docker image and what Git ignores, plus a real run in online mode.
 They take about 25 seconds, use a pretend Cognee (so no Gemini calls), and each one runs in its own
 temporary folder, so they never touch your real memories or keys.
 
