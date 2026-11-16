@@ -102,6 +102,7 @@ function render() {
         h("span", { class: "badge topic" }, m.topic),
         verifiedBadge(m),
         h("span", { class: "badge" }, m.visibility === "shared" ? "👥 " + sharingText(m) : "🔒 Private"),
+        m.processing ? h("span", { class: "badge", title: "Being added to search in the background" }, "⏳ Processing") : null,
         h("span", { class: "spacer" }),
         confidenceBadge(m.confidence)),
       h("p", { class: "item-note" }, m.note),

@@ -176,6 +176,13 @@ if __name__ == "__main__":
 
     async def memoria_app(scope, receive, send):
         """Send dashboard addresses to the dashboard, everything else to the agents' server."""
+        if scope["type"] == "lifespan":  # on start-up, finish memories left half-processed
+            async def receive_and_resume():
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    memoria.start_background_work()
+                return message
+            return await agents_app(scope, receive_and_resume, send)
         if scope["type"] == "http" and dashboard.handles(scope["path"]):
             return await dashboard.app(scope, receive, send)
         return await agents_app(scope, receive, send)
