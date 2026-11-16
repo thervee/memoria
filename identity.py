@@ -20,7 +20,6 @@ This file deliberately does not import Cognee, so making a pass is fast.
 import base64
 import ctypes
 import json
-import os
 import re
 import time
 from datetime import datetime, timezone
@@ -100,7 +99,7 @@ def _key_file(name: str) -> Path:
 # ---------- the server secret: encrypts developer accounts' agent keys ----------
 
 def _server_secret() -> Fernet:
-    secret = os.environ.get("MEMORIA_SECRET_KEY", "").strip()
+    secret = paths.server_secret()  # (also accepts the whole line, quotes or spaces)
     if not secret:
         raise IdentityError("MEMORIA_SECRET_KEY isn't set. Make one with "
                             "'manage_accounts.py make-secret' and put it in .env.")

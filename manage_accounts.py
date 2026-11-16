@@ -1,8 +1,8 @@
 """Manage developer accounts (for hosting Memoria online). Run it on the server.
 
     python manage_accounts.py make-secret
-        Make a server secret. Put it in .env as MEMORIA_SECRET_KEY=... (once, before
-        creating accounts). It locks developers' agent signing keys; keep it private
+        Make a server secret, once, before creating accounts. It prints the Name and
+        Value to add in Railway's Variables tab (or the line for a .env file). It locks developers' agent signing keys; keep it private
         and back it up: without it, those agents can't sign memories any more.
 
     python manage_accounts.py create <account> [--name "Acme Ltd"] [--email dev@acme.example]
@@ -79,8 +79,14 @@ def main(argv=None) -> None:
 
     try:
         if args.command == "make-secret":
-            print("Put this line in .env on the server (and keep a private copy):\n")
-            print(f"MEMORIA_SECRET_KEY={identity.make_server_secret()}")
+            secret = identity.make_server_secret()
+            print("Your new server secret. Keep a private copy (e.g. in a password manager):")
+            print("if it's lost, developers' agents can no longer sign memories.\n")
+            print("In Railway, Variables tab, New Variable:")
+            print("  Name:   MEMORIA_SECRET_KEY")
+            print(f"  Value:  {secret}\n")
+            print("Or, in a .env file (or Railway's Raw Editor), this whole line:")
+            print(f"  MEMORIA_SECRET_KEY={secret}")
         elif args.command == "create":
             accounts.create_account(args.account, args.name, args.email)
             print(f"Created account '{args.account.strip().lower()}'. "
