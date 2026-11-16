@@ -123,16 +123,47 @@ protect against someone who already controls Memoria and your Windows account on
 | `start_memoria_hidden.vbs` | Starts Memoria with no window (used at Windows login) |
 | `keep_memoria_running.py` | The watchdog that restarts Memoria if it crashes |
 | `stop_memoria.bat` | Double-click to stop Memoria (and its watchdog) |
-| `memory_store/` | **All your memories.** Back up this folder to keep them safe. |
+| `memory_store/` | **All your memories.** Backed up automatically every day (see Backups). |
+| `backups/` | The automatic backups (private: never uploaded to GitHub) |
+| `backup.py` | Makes the daily backups and deletes the oldest ones |
+| `restore_backup.bat` / `restore_backup.py` | Double-click to put a backup back (Memoria must be stopped) |
 | `memory_store/memories.json` | Readable list of every memory, its labels and its history |
 | `memory_store/agents.json` | Every agent ID that has used Memoria |
 | `memory_store/activity.log` | Who saved, searched or updated what, and when (plus any background processing errors) |
 | `memory_store/pending_forget.json` | Deleted memories still waiting to be removed from Cognee's databases |
 
+## Backups
+Memoria backs up `memory_store` by itself: when it starts (if the newest backup is more than a day
+old) and then once a day while it runs. Each backup is one zip file in the `backups` folder, e.g.
+`memoria-backup-2026-11-16_104640.zip`, and the newest 14 are kept.
+- **What's in it:** your memories with their history and signatures, the agent list, the activity log
+  and Cognee's databases. Left out, because they can be re-created: the downloaded search model
+  (it downloads again if needed), logs and lock files.
+- **Safe copies:** for the few seconds a backup takes, Memoria holds new saves and pauses the
+  background worker, so the copy is never caught halfway through a change. Searches carry on.
+- **Each backup is checked** after it's written. Backups and any failures are written to
+  `memory_store\activity.log` (`backup` / `backup_error`); a failed backup is tried again an hour later.
+- **Keep them somewhere else too:** the `backups` folder is on the same disk as Memoria, so it protects
+  against mistakes and damaged files, not a broken disk. To keep backups on a USB drive or another
+  disk, add `MEMORIA_BACKUP_DIR=E:\MemoriaBackups` (your own folder) to `.env` and restart Memoria.
+  `MEMORIA_BACKUP_KEEP=30` keeps more of them. Backups hold your private memories, so only choose a
+  folder you trust (a cloud-synced folder uploads them to that cloud).
+
+**To restore a backup:**
+1. Double-click `stop_memoria.bat`.
+2. Double-click `restore_backup.bat`, and type the number of the backup you want.
+3. Double-click `start_memoria.bat`.
+
+Nothing is thrown away: your current `memory_store` is renamed to `memory_store.old-<date>` and
+kept. Delete that folder once you're happy with the restore.
+
+**Note:** backups cover `memory_store` only. Agents' keys live in the `keys` folder, which isn't in
+the backups. Without it, agents can't log in, and memories show NOT verified.
+
 ## Tests
-78 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
-who may delete, connecting agents (the bridge and Python helper), the background worker (including retries after failures), and the dashboard's
-safety checks. They take a few seconds, use a pretend Cognee (so no Gemini calls), and each one runs
+92 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+who may delete, connecting agents (the bridge and Python helper), the background worker (including
+retries after failures), backups and restoring them, and the dashboard's safety checks. They take a few seconds, use a pretend Cognee (so no Gemini calls), and each one runs
 in its own temporary folder, so they never touch your real memories or keys.
 
 Run them (in PowerShell, in the Memoria folder):

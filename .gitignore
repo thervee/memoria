@@ -13,6 +13,10 @@ dashboard_password*.json
 
 # Your memories, databases, downloaded models, logs and lock files
 memory_store/
+memory_store.*/
+
+# Backups of your memories (private, like memory_store)
+backups/
 
 # The Python workspace (re-created with: pip install -r requirements.txt)
 .venv/
