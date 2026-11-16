@@ -26,9 +26,20 @@ It's built on [Cognee](https://github.com/topoteretes/cognee) and runs on this l
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
 
-## Agent IDs
-Each agent connects with the header `X-Memoria-Agent: <its-id>` (Claude Code's is `claude-code`).
-IDs are lowercase letters, numbers and dashes, e.g. `researcher`. Connections without an ID are refused.
+## Agent IDs and keys
+Every agent has an ID (lowercase letters, numbers and dashes, e.g. `researcher`) and its own pair of
+Ed25519 keys:
+- a **secret key** in `keys/<agent>.key`. It's encrypted by Windows for your account only, the `keys`
+  folder can only be opened by your Windows account, and it's never uploaded to GitHub.
+- a **public key** in `keys/public_keys.json`. It's safe to share and lets anyone check that agent's signatures.
+
+**Register a new agent:** double-click `register_agent.bat` and type its ID.
+Registered so far: `claude-code`, `researcher`, `trader`, `outsider`.
+
+**Agents must prove who they are.** Every request needs `Authorization: Bearer <login pass>`, where
+the pass is made with the agent's secret key and is valid for 1 hour. `make_token.py <agent-id>` prints
+one. Claude Code runs it automatically when it connects. Requests without a valid pass get "401" and
+are refused, and an agent can't claim another agent's ID.
 
 ## Sharing
 Every memory is either:
@@ -37,9 +48,21 @@ Every memory is either:
 
 Agents only ever see memories they're allowed to read. Anything else acts as if it doesn't exist.
 
-**Important limit:** agent IDs are taken on trust. Memoria believes whatever ID a connection
-claims, so this keeps agents' memories tidy and separate, but it isn't a security lock against
-a program that deliberately pretends to be another agent.
+## Signatures
+Every saved or updated memory is signed with the secret key of the agent that wrote that version.
+The signature and the agent's public key are stored with the memory. `find_memory` re-checks every
+signature and shows **verified** or **NOT verified** with a reason, for example:
+- `verified: signed by researcher`
+- `NOT verified: the memory was changed after it was signed`
+- `NOT verified: no signature (saved before signing was added)`
+
+The signature covers the memory's content and authorship labels (ID, topic, confidence, note, reason,
+who wrote it and when). It does not cover sharing settings, so changing who can read a memory doesn't
+affect it.
+
+**Limit to know:** Memoria signs on the agent's behalf, after the agent has proven who it is with its key.
+So a signature proves "an agent holding this key saved it, and it hasn't changed since". It does not
+protect against someone who already controls Memoria and your Windows account on this laptop.
 
 ## Files
 | File / folder | What it is |
@@ -47,7 +70,11 @@ a program that deliberately pretends to be another agent.
 | `.env` | Settings and your Gemini API key. **Keep private.** |
 | `setup_cognee.py` | Points Cognee at local storage |
 | `memoria.py` | The memory engine (save / find / update) |
-| `server.py` | The shared MCP server that gives agents the memory tools |
+| `server.py` | The shared MCP server that gives agents the memory tools (checks every login) |
+| `identity.py` | Agent keys, login passes and signatures |
+| `register_agent.bat` / `register_agent.py` | Register a new agent (creates its keys) |
+| `make_token.py` | Makes a login pass for an agent (Claude Code runs it automatically) |
+| `keys/` | **Agents' secret keys** and the public key list. Never shared or uploaded. |
 | `start_memoria.bat` | Double-click to start Memoria |
 | `start_memoria_hidden.vbs` | Starts Memoria with no window (used at Windows login) |
 | `keep_memoria_running.py` | The watchdog that restarts Memoria if it crashes |
@@ -64,4 +91,5 @@ a program that deliberately pretends to be another agent.
 ## Useful commands (type in PowerShell)
 - Check the connection: `claude mcp get memoria`
 - Disconnect from Claude Code: `claude mcp remove memoria -s user`
-- Connect another agent: give it the address `http://127.0.0.1:8765/mcp` and the header `X-Memoria-Agent: <its-id>`
+- Connect another agent: register it, then have it connect to `http://127.0.0.1:8765/mcp` with the
+  header printed by `.venv\Scripts\python.exe make_token.py <its-id>` (make a new one at least every hour)

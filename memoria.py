@@ -7,6 +7,11 @@ Every memory also has a visibility setting:
   - private: only the agent that wrote it can find or update it.
   - shared:  the writer plus the agent IDs listed in shared_with.
 
+Every memory is signed (Ed25519) by the agent that saved or last updated it.
+find_memory re-checks the signature and reports "verified" or "NOT verified".
+The signature covers the memory's content and authorship labels (ID, topic,
+confidence, note, reason, who wrote it and when) but not its sharing settings.
+
 Where things are kept (all inside the memory_store folder):
   - Cognee's databases: the memories themselves plus the knowledge graph
     Cognee builds from them (used for searching).
@@ -22,6 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from uuid import UUID
 
+import identity
 from setup_cognee import STORE, cognee
 from cognee import SearchType
 
@@ -146,9 +152,37 @@ def _as_text(mem: dict) -> str:
     return "\n".join(lines)
 
 
+SIGNED_FIELDS = ("id", "agent_id", "created_at", "topic", "confidence", "note", "reason",
+                 "updated_at", "updated_by")
+
+
+def _signed_content(mem: dict) -> bytes:
+    """The exact bytes that get signed: the memory's content and authorship labels."""
+    content = {field: mem.get(field) for field in SIGNED_FIELDS}
+    return ("memoria-memory-v1|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
+                                              separators=(",", ":"))).encode("utf-8")
+
+
+def _sign(mem: dict, agent_id: str) -> None:
+    try:
+        sig = identity.sign(agent_id, _signed_content(mem))
+    except identity.IdentityError as e:
+        raise MemoriaError(str(e)) from e
+    sig["signed_at"] = _now()
+    mem["signature"] = sig
+
+
+def _verification(mem: dict) -> dict:
+    """Check the memory's signature right now."""
+    expected = mem.get("updated_by") or mem["agent_id"]
+    ok, detail = identity.verify(_signed_content(mem), mem.get("signature"), expected)
+    return {"verification": "verified" if ok else "NOT verified", "verification_detail": detail}
+
+
 def _public(mem: dict) -> dict:
     """What agents get back: the memory and its labels (not Cognee's internal IDs)."""
     return {
+        **_verification(mem),
         "memory_id": mem["id"],
         "topic": mem["topic"],
         "note": mem["note"],
@@ -161,10 +195,12 @@ def _public(mem: dict) -> dict:
         "times_updated": len(mem.get("history", [])),
         "visibility": mem.get("visibility", "private"),
         "shared_with": mem.get("shared_with", []),
+        "signed_by": (mem.get("signature") or {}).get("signed_by"),
+        "public_key": (mem.get("signature") or {}).get("public_key"),
     }
 
 
-# ---------- the three actions ----------
+# ---------- the actions ----------
 
 async def save_memory(agent_id: str, note: str, reason: str, topic: str,
                       confidence: str = "medium", visibility: str = "private",
@@ -183,6 +219,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
         "visibility": visibility,
         "shared_with": shared_with,
     }
+    _sign(mem, agent_id)  # prove this agent wrote it
     async with _write_lock:
         result = await cognee.add(
             _as_text(mem),
@@ -284,6 +321,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
             mem["topic"] = topic.strip()
         mem["updated_at"] = _now()
         mem["updated_by"] = agent_id
+        _sign(mem, agent_id)  # the new version is signed by the agent that changed it
 
         # Cognee replaces the stored memory and rebuilds its part of the graph.
         result = await cognee.update(

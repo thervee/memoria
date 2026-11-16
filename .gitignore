@@ -5,6 +5,11 @@
 .env.*
 !.env.example
 
+# Agent keys: secret signing keys must never be uploaded
+keys/
+*.key
+*.pem
+
 # Your memories, databases, downloaded models, logs and lock files
 memory_store/
 
