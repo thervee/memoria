@@ -1,2 +1,10 @@
-cognee==1.6.8
-mcp==2.3.0
+# Every package Memoria's code uses, pinned to the versions tested on this laptop.
+# Install with: .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+cognee==1.6.8          # the memory engine and knowledge graph (memoria.py, setup_cognee.py)
+fastembed==0.9.1       # the free local search model, chosen in .env (EMBEDDING_PROVIDER=fastembed)
+mcp==2.3.0             # the server agents connect to (server.py)
+cryptography==50.0.2   # agent keys, login passes and signatures (identity.py)
+python-dotenv==1.2.4   # reads the .env settings file (setup_cognee.py)
+starlette==1.10.0      # the dashboard's web server side (dashboard.py)
+uvicorn==0.54.0        # runs the server on 127.0.0.1:8765 (server.py)
