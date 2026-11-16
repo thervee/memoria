@@ -95,6 +95,7 @@ def store(tmp_path, monkeypatch, keys):
     monkeypatch.setattr(memoria, "cognee", fake)
     # Fresh lock and worker for each test (each test runs its own event loop).
     monkeypatch.setattr(memoria, "_write_lock", asyncio.Lock())
+    monkeypatch.setattr(memoria, "_cognee_lock", asyncio.Lock())
     monkeypatch.setattr(memoria, "_worker", None)
     # The worker waits between retries; don't make the tests wait.
     real_sleep = asyncio.sleep

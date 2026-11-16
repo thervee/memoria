@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
+import backup  # noqa: E402
 import dashboard  # noqa: E402
 import identity  # noqa: E402
 import memoria  # noqa: E402
@@ -195,6 +196,7 @@ if __name__ == "__main__":
                 message = await receive()
                 if message["type"] == "lifespan.startup":
                     memoria.start_background_work()
+                    backup.start()  # daily backups of memory_store
                 return message
             return await agents_app(scope, receive_and_resume, send)
         if scope["type"] == "http" and dashboard.handles(scope["path"]):

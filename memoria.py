@@ -33,6 +33,7 @@ import json
 import re
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -52,6 +53,7 @@ VISIBILITY_LEVELS = ("private", "shared")
 AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 
 _write_lock = asyncio.Lock()  # one change to memories.json at a time
+_cognee_lock = asyncio.Lock()  # held by the background worker while it changes Cognee
 FORGET_GIVE_UP = 5  # stop retrying a Cognee removal after this many failures
 
 
@@ -440,6 +442,18 @@ def _kick() -> None:
         _worker = asyncio.get_running_loop().create_task(_work_loop())
 
 
+@asynccontextmanager
+async def paused():
+    """Hold every change (saves, updates, deletes and background work) while the block runs.
+
+    Used by backups, so they copy the memories and Cognee's databases at one moment
+    instead of halfway through a change. Searches carry on as normal.
+    """
+    async with _cognee_lock:  # wait for the worker to finish its current pass
+        async with _write_lock:
+            yield
+
+
 def start_background_work() -> None:
     """Called when Memoria starts: finish any work left from last time."""
     if _has_work():
@@ -456,7 +470,9 @@ async def _work_loop() -> None:
     """Keep working until everything is in Cognee. On failure, wait and try again."""
     wait = 15
     while _has_work():
-        if await _work_once():
+        async with _cognee_lock:  # a backup can pause the worker between passes
+            succeeded = await _work_once()
+        if succeeded:
             wait = 15
         else:  # e.g. Gemini is down or over its limit: back off, up to 10 minutes
             await asyncio.sleep(wait)
