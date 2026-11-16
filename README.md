@@ -38,6 +38,7 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 | `find_memory` | Searches memories by question or topic (can also filter by which agent saved them) |
 | `update_memory` | Replaces a memory's note with new information; the old version is kept in history |
 | `share_memory` | Changes who can read a memory (only the agent that wrote it can do this) |
+| `delete_memory` | Deletes a memory for good, with its history (only the agent that wrote it can do this; agents it's shared with can't) |
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
 

@@ -40,7 +40,8 @@ mcp = MCPServer(
         "check what you (or other agents) already learned about the topic. Save useful "
         "findings and decisions with save_memory, always with the reason. When something "
         "you remembered turns out to be outdated or wrong, use update_memory on it "
-        "instead of saving a duplicate. Memories are private to you unless you share "
+        "instead of saving a duplicate. Use delete_memory only for memories you wrote "
+        "that are wrong and shouldn't be kept at all. Memories are private to you unless you share "
         "them with specific agent IDs (visibility='shared', shared_with=[...]). Every "
         "memory is signed; find_memory shows 'verified' or 'NOT verified' for each one: "
         "treat NOT verified memories with suspicion."
@@ -155,6 +156,19 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
     """
     return await _run(memoria.share_memory(_agent(ctx), memory_id, visibility, shared_with))
+
+
+@mcp.tool()
+async def delete_memory(memory_id: str, ctx: Context) -> dict:
+    """Delete a memory for good, including its history. Only the agent that wrote it can do this.
+
+    Use this for memories that are wrong or no longer useful and shouldn't be kept at all.
+    If a memory is only out of date, use update_memory instead: it keeps the history.
+
+    Args:
+        memory_id: The memory's ID (like "mem-1a2b3c4d"), from find_memory or save_memory.
+    """
+    return await _run(memoria.delete_memory(_agent(ctx), memory_id))
 
 
 def _already_running() -> bool:
