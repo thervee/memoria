@@ -292,7 +292,7 @@ database in a single file, built into Python, with nothing to install or run).
   `manage_accounts.py`. To look inside, any SQLite viewer works (e.g. "DB Browser for SQLite").
 
 ## Tests
-213 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+220 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
 who may delete, connecting agents (the bridge and Python helper), the background worker (including
 retries after failures), backups and restoring them, the dashboard's safety checks, and hosting:
 developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up,

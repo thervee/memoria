@@ -43,6 +43,26 @@ PORT = int((os.environ.get("PORT", "").strip() if ONLINE else "")
            or os.environ.get("MEMORIA_PORT", "").strip() or 8765)
 
 
+SECRET_NAME = "MEMORIA_SECRET_KEY"
+
+
+def server_secret() -> str:
+    """MEMORIA_SECRET_KEY, cleaned up from the usual ways of pasting it.
+
+    In Railway's Variables tab it's easy to paste the whole line
+    (MEMORIA_SECRET_KEY=abc...=) into the Value box, or to add quotes or spaces.
+    All of these give the same secret here.
+    """
+    value = os.environ.get(SECRET_NAME, "").strip()
+    for _ in range(2):  # quotes may be around the value or around the whole line
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()
+        name, sign, rest = value.partition("=")
+        if sign and name.strip().upper() == SECRET_NAME:
+            value = rest.strip()
+    return value
+
+
 def online_problems() -> list[str]:
     """Settings that are missing or wrong for running online. Empty means all good."""
     if not ONLINE:
@@ -50,7 +70,7 @@ def online_problems() -> list[str]:
     problems = []
     if not os.environ.get("LLM_API_KEY", "").strip():
         problems.append("LLM_API_KEY (your Gemini API key) isn't set.")
-    secret = os.environ.get("MEMORIA_SECRET_KEY", "").strip()
+    secret = server_secret()
     if not secret:
         problems.append("MEMORIA_SECRET_KEY isn't set. Make one on your laptop with "
                         "'python manage_accounts.py make-secret'.")
@@ -59,8 +79,9 @@ def online_problems() -> list[str]:
         try:
             Fernet(secret)
         except ValueError:
-            problems.append("MEMORIA_SECRET_KEY isn't a valid secret. Make one with "
-                            "'python manage_accounts.py make-secret'.")
+            problems.append(f"MEMORIA_SECRET_KEY isn't a valid secret (it's {len(secret)} "
+                            "characters; a secret is 44, ending in '='). Paste exactly the "
+                            "Value that 'python manage_accounts.py make-secret' printed.")
     if DATA_DIR is None:
         problems.append("MEMORIA_DATA_DIR isn't set, so data would be lost on every deploy. "
                         "Set it to the folder where the volume is mounted, e.g. /data.")

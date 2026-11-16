@@ -336,3 +336,53 @@ def test_memoria_runs_online_with_all_data_in_the_data_folder(tmp_path):
         if (HERE / "memory_store").exists() else []
     assert after == before
     assert not (HERE / "keys" / "acme").exists()
+
+
+# ---------- the server secret, however it was pasted ----------
+
+def pasted_ways(secret):
+    return [secret, f"  {secret}  ", f'"{secret}"', f"'{secret}'",
+            f"MEMORIA_SECRET_KEY={secret}", f"MEMORIA_SECRET_KEY = {secret}",
+            f'MEMORIA_SECRET_KEY="{secret}"', f'"MEMORIA_SECRET_KEY={secret}"',
+            f"memoria_secret_key={secret}\n"]
+
+
+def test_secret_pasted_in_any_usual_way_is_accepted(online, monkeypatch):
+    secret = identity.make_server_secret()
+    for pasted in pasted_ways(secret):
+        monkeypatch.setenv("MEMORIA_SECRET_KEY", pasted)
+        assert paths.server_secret() == secret, pasted
+        assert paths.online_problems() == [], pasted
+
+
+def test_keys_locked_with_the_plain_secret_unlock_with_a_pasted_one(keys, monkeypatch):
+    import accounts
+    secret = identity.make_server_secret()
+    monkeypatch.setenv("MEMORIA_SECRET_KEY", secret)
+    accounts.create_account("acme")
+    accounts.create_key("acme", "trader")
+    for pasted in pasted_ways(secret):
+        monkeypatch.setenv("MEMORIA_SECRET_KEY", pasted)
+        assert identity.verify(b"hi", identity.sign("acme/trader", b"hi"), "acme/trader")[0]
+
+
+@pytest.mark.parametrize("pasted", ["not-a-secret", "MEMORIA_SECRET_KEY=", "OTHER_NAME=abc",
+                                    "MEMORIA_SECRET_KEY=too-short="])
+def test_a_wrong_secret_is_still_refused_with_a_hint(online, monkeypatch, pasted):
+    monkeypatch.setenv("MEMORIA_SECRET_KEY", pasted)
+    problems = paths.online_problems()
+    assert len(problems) == 1
+    assert "isn't set" in problems[0] or "a secret is 44, ending in '='" in problems[0]
+
+
+def test_make_secret_says_exactly_what_to_paste(capsys):
+    import manage_accounts
+    from cryptography.fernet import Fernet
+    manage_accounts.main(["make-secret"])
+    out = capsys.readouterr().out
+    name = re.search(r"^  Name:\s+(\S+)$", out, re.M).group(1)
+    value = re.search(r"^  Value:\s+(\S+)$", out, re.M).group(1)
+    assert name == "MEMORIA_SECRET_KEY" and len(value) == 44 and value.endswith("=")
+    Fernet(value)  # a real, working secret
+    assert f"  MEMORIA_SECRET_KEY={value}" in out  # the .env / Raw Editor line too
+    assert "Railway" in out and "private copy" in out
