@@ -6,10 +6,20 @@ ONE Memoria server runs on this laptop and every agent connects to it at
 agents never fight over the database files.
 
 Agents must PROVE who they are. Every request needs the header
-    Authorization: Bearer <login pass>
-where the login pass is made with the agent's secret key (see identity.py and
-make_token.py). Requests without a valid pass are refused with "401". Any agent
-name the request claims for itself is ignored; only the proven ID is used.
+    Authorization: Bearer <login pass or API key>
+  - this laptop's own agents use a login pass made with their secret key
+    (identity.py, make_token.py); they belong to the built-in account "local".
+  - developers' agents (when hosted online) use an API key (accounts.py), which
+    says which account and agent they are.
+Requests without a valid pass or key are refused with "401". Any agent or account
+name the request claims for itself is ignored; only the proven identity is used.
+
+Spam protection (limits.py): too many requests from one address or one agent,
+too many wrong keys, or requests that are too big are refused before they reach
+Memoria, with "429 Too Many Requests" or "413 Too Large".
+
+Developers can also sign themselves up at /signup if the host turns it on
+(MEMORIA_SIGNUP, see signup.py). It is off unless turned on.
 
 The same server also serves the dashboard webpage at
     http://127.0.0.1:8765/dashboard
@@ -26,13 +36,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
+import accounts  # noqa: E402
 import backup  # noqa: E402
 import dashboard  # noqa: E402
 import identity  # noqa: E402
+import limits  # noqa: E402
 import memoria  # noqa: E402
+import signup  # noqa: E402
 
 HOST, PORT = "127.0.0.1", 8765
-AGENT_HEADER = "x-memoria-agent"  # set ONLY by the login check below, never trusted from agents
+# Set ONLY by the login check below, never trusted from what a request sends.
+AGENT_HEADER = "x-memoria-agent"
+ACCOUNT_HEADER = "x-memoria-account"
 
 mcp = MCPServer(
     "memoria",
@@ -50,8 +65,36 @@ mcp = MCPServer(
 )
 
 
+async def _refuse(send, status: int, error: str, message: str, headers=()) -> None:
+    body = json.dumps({"error": error, "message": message}).encode()
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"), *headers]})
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _too_many(send, wait: float, message: str) -> None:
+    seconds = max(1, round(wait))
+    await _refuse(send, 429, "too_many_requests", f"{message} Try again in {seconds} seconds.",
+                  [(b"retry-after", str(seconds).encode())])
+
+
+def _capped(receive, most: int):
+    """Stop reading a request body once it passes `most` bytes (for bodies sent in pieces)."""
+    seen = 0
+
+    async def wrapped():
+        nonlocal seen
+        message = await receive()
+        if message["type"] == "http.request":
+            seen += len(message.get("body", b""))
+            if seen > most:
+                return {"type": "http.disconnect"}
+        return message
+    return wrapped
+
+
 class LoginCheck:
-    """Checks the login pass on every request before it reaches Memoria."""
+    """Checks every request before it reaches Memoria: limits first, then the login."""
 
     def __init__(self, app):
         self.app = app
@@ -59,31 +102,65 @@ class LoginCheck:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":  # start-up / shut-down messages pass straight through
             return await self.app(scope, receive, send)
-        headers = [(k, v) for k, v in scope["headers"] if k.lower() != AGENT_HEADER.encode()]
-        auth = dict(headers).get(b"authorization", b"").decode(errors="replace")
+        ip = limits.client_ip(scope)
+
+        # 1. Spam protection: too many requests from this address?
+        if not limits.is_this_computer(ip):
+            wait = limits.per_ip.allow(ip)
+            if wait:
+                return await _too_many(send, wait, "Too many requests from your address.")
+            wait = limits.failed_logins.blocked_for(ip)
+            if wait:
+                return await _too_many(send, wait, "Too many wrong API keys from your address.")
+
+        # 2. Throw away any identity the request claims for itself.
+        drop = {AGENT_HEADER.encode(), ACCOUNT_HEADER.encode()}
+        headers = [(k, v) for k, v in scope["headers"] if k.lower() not in drop]
+        found = dict(headers)
+        length = found.get(b"content-length", b"0")
+        if not length.isdigit() or int(length) > limits.MAX_REQUEST_BYTES:
+            return await _refuse(send, 413, "too_large",
+                                 f"Requests can be {limits.MAX_REQUEST_BYTES:,} bytes at most.")
+
+        # 3. Who is this? A login pass (this laptop's agents) or an API key (developers).
+        auth = found.get(b"authorization", b"").decode(errors="replace")
         try:
             if not auth.lower().startswith("bearer "):
-                raise identity.IdentityError("No login pass. Send 'Authorization: Bearer <pass>'.")
-            agent_id = identity.check_token(auth[7:])
-        except identity.IdentityError as e:
-            body = ('{"error": "unauthorized", "message": ' + json.dumps(str(e)) + "}").encode()
-            await send({"type": "http.response.start", "status": 401,
-                        "headers": [(b"content-type", b"application/json"),
-                                    (b"www-authenticate", b"Bearer")]})
-            await send({"type": "http.response.body", "body": body})
-            return
-        # Replace whatever the agent claimed with the identity its key proved.
-        scope = dict(scope, headers=headers + [(AGENT_HEADER.encode(), agent_id.encode())])
-        await self.app(scope, receive, send)
+                raise identity.IdentityError(
+                    "No login pass or API key. Send 'Authorization: Bearer <key>'.")
+            credential = auth[7:].strip()
+            if credential.startswith(accounts.KEY_PREFIX):
+                account, agent_id = accounts.check_key(credential)
+            else:
+                account, agent_id = identity.LOCAL, identity.check_token(credential)
+        except (identity.IdentityError, accounts.AccountError) as e:
+            if not limits.is_this_computer(ip):
+                limits.failed_logins.hit(ip)
+            return await _refuse(send, 401, "unauthorized", str(e),
+                                 [(b"www-authenticate", b"Bearer")])
+
+        # 4. Spam protection: too many requests from this agent?
+        account_limits = accounts.limits(account)
+        if account_limits:
+            wait = limits.per_agent.allow(identity.principal(account, agent_id),
+                                          account_limits["requests_per_minute"])
+            if wait:
+                return await _too_many(send, wait, "This agent is sending too many requests.")
+
+        # 5. Pass the PROVEN identity on to the tools.
+        scope = dict(scope, headers=headers + [(AGENT_HEADER.encode(), agent_id.encode()),
+                                               (ACCOUNT_HEADER.encode(), account.encode())])
+        await self.app(scope, _capped(receive, limits.MAX_REQUEST_BYTES), send)
 
 
-def _agent(ctx: Context) -> str:
-    """The calling agent's ID, as proven by its login pass."""
+def _agent(ctx: Context) -> tuple[str, str]:
+    """The calling agent's ID and account, as proven by its login pass or API key."""
     headers = {k.lower(): v for k, v in (ctx.headers or {}).items()}
     agent_id = headers.get(AGENT_HEADER, "").strip()
-    if not agent_id:  # can't happen behind LoginCheck, but never guess an identity
+    account = headers.get(ACCOUNT_HEADER, "").strip()
+    if not agent_id or not account:  # can't happen behind LoginCheck, but never guess
         raise ToolError("Not logged in.")
-    return agent_id
+    return agent_id, account
 
 
 async def _run(action):
@@ -108,8 +185,9 @@ async def save_memory(note: str, reason: str, topic: str, ctx: Context,
         visibility: "private" (only you can read it) or "shared" (you plus shared_with).
         shared_with: For shared memories: the agent IDs allowed to read it, e.g. ["trader"].
     """
-    return await _run(memoria.save_memory(_agent(ctx), note, reason, topic, confidence,
-                                          visibility, shared_with))
+    agent_id, account = _agent(ctx)
+    return await _run(memoria.save_memory(agent_id, note, reason, topic, confidence,
+                                          visibility, shared_with, account=account))
 
 
 @mcp.tool()
@@ -125,7 +203,9 @@ async def find_memory(query: str, ctx: Context, topic: str | None = None,
         saved_by: Optional: only return memories saved by this agent ID.
         limit: How many memories to return (1-20).
     """
-    return await _run(memoria.find_memory(_agent(ctx), query, topic, saved_by, limit))
+    agent_id, account = _agent(ctx)
+    return await _run(memoria.find_memory(agent_id, query, topic, saved_by, limit,
+                                          account=account))
 
 
 @mcp.tool()
@@ -142,8 +222,9 @@ async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context
         confidence: Optional new confidence: "low", "medium" or "high".
         topic: Optional new topic label.
     """
-    return await _run(memoria.update_memory(_agent(ctx), memory_id, new_note, reason,
-                                            confidence, topic))
+    agent_id, account = _agent(ctx)
+    return await _run(memoria.update_memory(agent_id, memory_id, new_note, reason,
+                                            confidence, topic, account=account))
 
 
 @mcp.tool()
@@ -156,7 +237,9 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
         visibility: "private" (only the writer) or "shared" (the writer plus shared_with).
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
     """
-    return await _run(memoria.share_memory(_agent(ctx), memory_id, visibility, shared_with))
+    agent_id, account = _agent(ctx)
+    return await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
+                                           account=account))
 
 
 @mcp.tool()
@@ -169,7 +252,8 @@ async def delete_memory(memory_id: str, ctx: Context) -> dict:
     Args:
         memory_id: The memory's ID (like "mem-1a2b3c4d"), from find_memory or save_memory.
     """
-    return await _run(memoria.delete_memory(_agent(ctx), memory_id))
+    agent_id, account = _agent(ctx)
+    return await _run(memoria.delete_memory(agent_id, memory_id, account=account))
 
 
 def _already_running() -> bool:
@@ -179,18 +263,12 @@ def _already_running() -> bool:
         return s.connect_ex((HOST, PORT)) == 0
 
 
-if __name__ == "__main__":
-    if _already_running():
-        print("Memoria is already running. Nothing to do.", file=sys.stderr)
-        sys.exit(0)
-    print(f"Memoria is running at http://{HOST}:{PORT}/mcp  (close this window to stop it)",
-          file=sys.stderr)
-    import uvicorn
-
+def build_app():
+    """The whole of Memoria: the agents' server, the dashboard and sign-up, at one address."""
     agents_app = LoginCheck(mcp.streamable_http_app(host=HOST))
 
     async def memoria_app(scope, receive, send):
-        """Send dashboard addresses to the dashboard, everything else to the agents' server."""
+        """Send each address to the right part of Memoria."""
         if scope["type"] == "lifespan":  # on start-up, finish memories left half-processed
             async def receive_and_resume():
                 message = await receive()
@@ -201,6 +279,19 @@ if __name__ == "__main__":
             return await agents_app(scope, receive_and_resume, send)
         if scope["type"] == "http" and dashboard.handles(scope["path"]):
             return await dashboard.app(scope, receive, send)
+        if scope["type"] == "http" and signup.handles(scope["path"]):
+            return await signup.app(scope, receive, send)
         return await agents_app(scope, receive, send)
 
-    uvicorn.run(memoria_app, host=HOST, port=PORT, log_level="warning")
+    return memoria_app
+
+
+if __name__ == "__main__":
+    if _already_running():
+        print("Memoria is already running. Nothing to do.", file=sys.stderr)
+        sys.exit(0)
+    print(f"Memoria is running at http://{HOST}:{PORT}/mcp  (close this window to stop it)",
+          file=sys.stderr)
+    import uvicorn
+
+    uvicorn.run(build_app(), host=HOST, port=PORT, log_level="warning")

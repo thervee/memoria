@@ -3,6 +3,11 @@
 Every memory carries four labels: which agent wrote it, when, its topic,
 and a confidence level (low / medium / high).
 
+Every memory belongs to one ACCOUNT: "local" for this laptop's own agents, or a
+developer's account when Memoria is hosted online (see accounts.py). Agents only
+ever see memories of their own account, and each account has its own Cognee
+dataset, so one developer's searches never touch another's memories.
+
 Every memory also has a visibility setting:
   - private: only the agent that wrote it can find or update it.
   - shared:  the writer plus the agent IDs listed in shared_with.
@@ -37,6 +42,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
+import accounts
 import identity
 from setup_cognee import STORE, cognee
 from cognee import SearchType
@@ -46,11 +52,17 @@ INDEX_FILE = STORE / "memories.json"
 AGENTS_FILE = STORE / "agents.json"
 ACTIVITY_FILE = STORE / "activity.log"
 FORGET_FILE = STORE / "pending_forget.json"
+USAGE_FILE = STORE / "usage.json"  # each developer account's writes today (for its limits)
+LOCAL = identity.LOCAL
 
 CONFIDENCE_LEVELS = ("low", "medium", "high")
 VISIBILITY_LEVELS = ("private", "shared")
 # Agent IDs are short and simple: lowercase letters, numbers and dashes, e.g. "claude-code".
 AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
+# Spam protection: the longest text accepted, for everyone.
+MAX_LENGTHS = {"note": 4000, "new_note": 4000, "reason": 2000, "topic": 100, "query": 1000,
+               "memory_id": 40}
+MAX_SHARED_WITH = 20
 
 _write_lock = asyncio.Lock()  # one change to memories.json at a time
 _cognee_lock = asyncio.Lock()  # held by the background worker while it changes Cognee
@@ -87,16 +99,25 @@ def _log(agent_id: str, action: str, **details) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def check_agent(agent_id: str) -> str:
+def account_of(mem: dict) -> str:
+    return mem.get("account", LOCAL)  # memories from before accounts existed are "local"
+
+
+def dataset_for(account: str) -> str:
+    """Each account's own Cognee dataset ("memoria" for this laptop's agents)."""
+    return DATASET if account == LOCAL else f"{DATASET}-{account}"
+
+
+def check_agent(agent_id: str, account: str = LOCAL) -> str:
     """Make sure the agent ID is valid and remember that this agent exists."""
     agent_id = (agent_id or "").strip().lower()
-    if not AGENT_ID_PATTERN.match(agent_id):
+    if not AGENT_ID_PATTERN.match(agent_id) or not AGENT_ID_PATTERN.match(account or ""):
         raise MemoriaError(
             "agent_id must be 2-40 characters: lowercase letters, numbers and dashes "
             "(for example 'claude-code' or 'research-bot')."
         )
     agents = _read_json(AGENTS_FILE, {})
-    info = agents.setdefault(agent_id, {"first_seen": _now()})
+    info = agents.setdefault(identity.principal(account, agent_id), {"first_seen": _now()})
     info["last_seen"] = _now()
     _write_json(AGENTS_FILE, agents)
     return agent_id
@@ -118,6 +139,8 @@ def _check_sharing(visibility: str, shared_with, owner: str) -> tuple[str, list[
         return "private", []
     if isinstance(shared_with, str):  # allow "trader, analyst" as well as a list
         shared_with = shared_with.split(",")
+    if len(shared_with or []) > MAX_SHARED_WITH:
+        raise MemoriaError(f"A memory can be shared with {MAX_SHARED_WITH} agents at most.")
     readers = []
     for agent in shared_with or []:
         agent = agent.strip().lower()
@@ -133,8 +156,10 @@ def _check_sharing(visibility: str, shared_with, owner: str) -> tuple[str, list[
     return "shared", readers
 
 
-def can_see(mem: dict, agent_id: str) -> bool:
-    """True if this agent is allowed to read the memory."""
+def can_see(mem: dict, agent_id: str, account: str = LOCAL) -> bool:
+    """True if this agent (of this account) is allowed to read the memory."""
+    if account_of(mem) != account:  # never across accounts
+        return False
     if mem["agent_id"] == agent_id:
         return True
     return mem.get("visibility") == "shared" and agent_id in mem.get("shared_with", [])
@@ -144,7 +169,36 @@ def _require(value: str, name: str) -> str:
     value = (value or "").strip()
     if not value:
         raise MemoriaError(f"{name} can't be empty.")
+    longest = MAX_LENGTHS.get(name, 10_000)
+    if len(value) > longest:
+        raise MemoriaError(f"{name} is too long ({longest:,} characters at most).")
     return value
+
+
+def _use_quota(index: dict, account: str, new_memory: bool) -> None:
+    """Spam protection for developer accounts: refuse writes over the account's limits.
+
+    Call while holding _write_lock. This laptop's own agents have no limits.
+    """
+    limit = accounts.limits(account)
+    if limit is None:
+        return
+    if new_memory:
+        count = sum(1 for m in index.values() if account_of(m) == account)
+        if count >= limit["max_memories"]:
+            raise MemoriaError(f"This account has reached its limit of {limit['max_memories']:,} "
+                               "memories. Delete some, or ask the host for a higher limit.")
+    usage = _read_json(USAGE_FILE, {})
+    today = _now()[:10]
+    used = usage.get(account)
+    if not used or used["day"] != today:
+        used = {"day": today, "writes": 0}
+    if used["writes"] >= limit["writes_per_day"]:
+        raise MemoriaError(f"This account has used its {limit['writes_per_day']:,} saves and "
+                           "updates for today. The limit resets at midnight (UTC).")
+    used["writes"] += 1
+    usage[account] = used
+    _write_json(USAGE_FILE, usage)
 
 
 def _as_text(mem: dict) -> str:
@@ -172,6 +226,8 @@ SIGNED_FIELDS = ("id", "agent_id", "created_at", "topic", "confidence", "note", 
 def _signed_content(mem: dict) -> bytes:
     """The exact bytes that get signed: the memory's content and authorship labels."""
     content = {field: mem.get(field) for field in SIGNED_FIELDS}
+    if account_of(mem) != LOCAL:  # (left out for "local", so older signatures still match)
+        content["account"] = account_of(mem)
     return ("memoria-memory-v1|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
                                               separators=(",", ":"))).encode("utf-8")
 
@@ -187,7 +243,7 @@ def _sign(mem: dict, agent_id: str) -> None:
 
 def _verification(mem: dict) -> dict:
     """Check the memory's signature right now."""
-    expected = mem.get("updated_by") or mem["agent_id"]
+    expected = identity.principal(account_of(mem), mem.get("updated_by") or mem["agent_id"])
     ok, detail = identity.verify(_signed_content(mem), mem.get("signature"), expected)
     return {"verification": "verified" if ok else "NOT verified", "verification_detail": detail}
 
@@ -197,6 +253,7 @@ def _public(mem: dict) -> dict:
     return {
         **_verification(mem),
         "memory_id": mem["id"],
+        "account": account_of(mem),
         "topic": mem["topic"],
         "note": mem["note"],
         "reason": mem["reason"],
@@ -219,11 +276,13 @@ def _public(mem: dict) -> dict:
 
 async def save_memory(agent_id: str, note: str, reason: str, topic: str,
                       confidence: str = "medium", visibility: str = "private",
-                      shared_with: list[str] | None = None) -> dict:
-    agent_id = check_agent(agent_id)
+                      shared_with: list[str] | None = None, account: str = LOCAL) -> dict:
+    agent_id = check_agent(agent_id, account)
+    who = identity.principal(account, agent_id)
     visibility, shared_with = _check_sharing(visibility, shared_with, agent_id)
     mem = {
         "id": "mem-" + uuid.uuid4().hex[:8],
+        "account": account,
         "agent_id": agent_id,
         "created_at": _now(),
         "topic": _require(topic, "topic"),
@@ -234,30 +293,32 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
         "visibility": visibility,
         "shared_with": shared_with,
     }
-    _sign(mem, agent_id)  # prove this agent wrote it
+    _sign(mem, who)  # prove this agent wrote it
     _mark_changed(mem)  # the background worker adds it to Cognee
     async with _write_lock:
         index = _read_json(INDEX_FILE, {})
+        _use_quota(index, account, new_memory=True)
         index[mem["id"]] = mem
         _write_json(INDEX_FILE, index)
-    _log(agent_id, "save", memory_id=mem["id"], topic=mem["topic"])
+    _log(who, "save", memory_id=mem["id"], topic=mem["topic"])
     _kick()
     return _public(mem)
 
 
 async def find_memory(agent_id: str, query: str, topic: str | None = None,
-                      saved_by: str | None = None, limit: int = 5) -> list[dict]:
-    agent_id = check_agent(agent_id)
+                      saved_by: str | None = None, limit: int = 5,
+                      account: str = LOCAL) -> list[dict]:
+    agent_id = check_agent(agent_id, account)
     query = _require(query, "query")
     limit = max(1, min(int(limit or 5), 20))
     index = _read_json(INDEX_FILE, {})
-    _log(agent_id, "find", query=query, topic=topic, saved_by=saved_by)
+    _log(identity.principal(account, agent_id), "find", query=query, topic=topic, saved_by=saved_by)
     _kick()  # finish any work left over from before Memoria was restarted
     if not index:
         return []
 
     def wanted(mem: dict) -> bool:
-        if not can_see(mem, agent_id):  # never show memories this agent isn't allowed to read
+        if not can_see(mem, agent_id, account):  # never show memories this agent isn't allowed to read
             return False
         if topic and topic.strip().lower() not in mem["topic"].lower():
             return False
@@ -265,14 +326,16 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
             return False
         return True
 
-    by_data_id = {m["data_id"]: m for m in index.values() if m.get("data_id")}
+    by_data_id = {m["data_id"]: m for m in index.values()
+                  if m.get("data_id") and account_of(m) == account}
     found: list[dict] = []
 
     # 1. Ask Cognee for the stored passages closest in meaning to the question.
     #    (If nothing has been processed yet, Cognee has no search data, so skip it.)
     if by_data_id:
         results = await cognee.search(
-            query, query_type=SearchType.CHUNKS, datasets=[DATASET], top_k=max(50, limit * 10)
+            query, query_type=SearchType.CHUNKS, datasets=[dataset_for(account)],
+            top_k=max(50, limit * 10)
         )
         for chunk in _chunks(results):
             mem = by_data_id.get(str(chunk.get("document_id")))
@@ -319,17 +382,22 @@ def _words(text: str) -> set[str]:
 
 
 async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: str,
-                        confidence: str | None = None, topic: str | None = None) -> dict:
-    agent_id = check_agent(agent_id)
+                        confidence: str | None = None, topic: str | None = None,
+                        account: str = LOCAL) -> dict:
+    agent_id = check_agent(agent_id, account)
+    who = identity.principal(account, agent_id)
     memory_id = _require(memory_id, "memory_id")
     new_note = _require(new_note, "new_note")
     reason = _require(reason, "reason")
+    if topic:
+        topic = _require(topic, "topic")
 
     async with _write_lock:
         index = _read_json(INDEX_FILE, {})
         mem = index.get(memory_id)
-        if mem is None or not can_see(mem, agent_id):
+        if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
+        _use_quota(index, account, new_memory=False)
 
         # Keep the old version in the history so nothing is lost.
         mem["history"].append({
@@ -344,12 +412,12 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
             mem["topic"] = topic.strip()
         mem["updated_at"] = _now()
         mem["updated_by"] = agent_id
-        _sign(mem, agent_id)  # the new version is signed by the agent that changed it
+        _sign(mem, who)  # the new version is signed by the agent that changed it
         _mark_changed(mem)  # the background worker updates it in Cognee
 
         index[memory_id] = mem
         _write_json(INDEX_FILE, index)
-    _log(agent_id, "update", memory_id=memory_id)
+    _log(who, "update", memory_id=memory_id)
     _kick()
     out = _public(mem)
     out["previous_note"] = mem["history"][-1]["note"]
@@ -357,14 +425,15 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
 
 
 async def share_memory(agent_id: str, memory_id: str, visibility: str,
-                       shared_with: list[str] | None = None, via: str | None = None) -> dict:
+                       shared_with: list[str] | None = None, via: str | None = None,
+                       account: str = LOCAL) -> dict:
     """Change who can read a memory. Only the agent that wrote it may do this."""
-    agent_id = check_agent(agent_id)
+    agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     async with _write_lock:
         index = _read_json(INDEX_FILE, {})
         mem = index.get(memory_id)
-        if mem is None or not can_see(mem, agent_id):
+        if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
         if mem["agent_id"] != agent_id:
             raise MemoriaError(
@@ -374,21 +443,22 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
         mem["visibility"], mem["shared_with"] = _check_sharing(visibility, shared_with, agent_id)
         index[memory_id] = mem
         _write_json(INDEX_FILE, index)
-    _log(agent_id, "share", memory_id=memory_id,
+    _log(identity.principal(account, agent_id), "share", memory_id=memory_id,
          before={"visibility": before[0], "shared_with": before[1]},
          after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
          **({"via": via} if via else {}))
     return _public(mem)
 
 
-async def delete_memory(agent_id: str, memory_id: str, via: str | None = None) -> dict:
+async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
+                        account: str = LOCAL) -> dict:
     """Delete a memory for good. Only the agent that wrote it may do this."""
-    agent_id = check_agent(agent_id)
+    agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     async with _write_lock:
         index = _read_json(INDEX_FILE, {})
         mem = index.get(memory_id)
-        if mem is None or not can_see(mem, agent_id):
+        if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'.")
         if mem["agent_id"] != agent_id:
             raise MemoriaError(
@@ -400,7 +470,7 @@ async def delete_memory(agent_id: str, memory_id: str, via: str | None = None) -
         # If it was never added to Cognee, the worker notices that and skips it.
         if mem.get("data_id"):
             _queue_forget(mem["data_id"], mem["dataset_id"], memory_id)
-    _log(agent_id, "delete", memory_id=memory_id, topic=mem["topic"],
+    _log(identity.principal(account, agent_id), "delete", memory_id=memory_id, topic=mem["topic"],
          **({"via": via} if via else {}))
     _kick()
     return {"deleted": memory_id}
@@ -511,7 +581,8 @@ async def _work_once() -> bool:
         todo = [dict(m) for m in _read_json(INDEX_FILE, {}).values() if m.get("needs_sync")]
     added = []
     for mem in todo:
-        node_set = [f"agent:{mem['agent_id']}", f"topic:{mem['topic']}"]
+        node_set = [f"account:{account_of(mem)}", f"agent:{mem['agent_id']}",
+                    f"topic:{mem['topic']}"]
         try:
             if mem.get("data_id") and not mem.get("processed", True) \
                     and mem.get("added_version") == mem.get("sync_version"):
@@ -527,7 +598,7 @@ async def _work_once() -> bool:
                     raise RuntimeError(result["error"])
                 await _mark_done(mem, processed=True)
             else:
-                result = await cognee.add(_as_text(mem), dataset_name=DATASET,
+                result = await cognee.add(_as_text(mem), dataset_name=dataset_for(account_of(mem)),
                                           node_set=node_set)
                 if await _record_added(mem, str(result.data_ids[0]), str(result.dataset_id)):
                     added.append(mem)
@@ -538,7 +609,7 @@ async def _work_once() -> bool:
     # 3. Cognee reads all newly added memories in ONE run and builds the graph.
     if added:
         try:
-            await cognee.cognify(datasets=[DATASET])
+            await cognee.cognify(datasets=sorted({dataset_for(account_of(m)) for m in added}))
         except Exception as e:
             _background_error("building the knowledge graph", e)
             return False  # the memories stay "processing"; next pass tries again
