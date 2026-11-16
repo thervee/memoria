@@ -13,7 +13,8 @@ import memoria as m
 import memoria_bridge
 import server
 import signup
-from conftest import settle
+import db
+from conftest import index, save_index, settle
 from memoria_client import Memoria
 from mcp import types
 
@@ -87,18 +88,18 @@ def test_developer_memories_are_signed_by_account_and_agent(store, devs):
 
 def test_moving_a_memory_to_another_account_breaks_its_signature(store, devs):
     mid = save("acme")["memory_id"]
-    data = json.loads(m.INDEX_FILE.read_text())
-    data[mid]["account"] = "globex"  # someone edits the file to hand it to globex
-    m._write_json(m.INDEX_FILE, data)
+    data = index()
+    data[mid]["account"] = "globex"  # someone edits the database to hand it to globex
+    save_index(data)
     shown = m.all_memories()[0]
     assert shown["account"] == "globex" and shown["verification"] == "NOT verified"
 
 
 def test_older_memories_count_as_this_laptops(store):
     mid = save("local", agent="alice")["memory_id"]
-    data = json.loads(m.INDEX_FILE.read_text())
+    data = index()
     del data[mid]["account"]  # saved before accounts existed
-    m._write_json(m.INDEX_FILE, data)
+    save_index(data)
     assert m.all_memories()[0]["account"] == "local"
     assert m.all_memories()[0]["verification"] == "verified"
     assert found("local", agent="alice") == [mid]
@@ -118,7 +119,7 @@ def test_daily_writes_are_limited(store, devs):
 def test_writes_reset_the_next_day(store, devs):
     accounts.set_limit("acme", "writes_per_day", 1)
     save("acme")
-    m._write_json(m.USAGE_FILE, {"acme": {"day": "2000-01-01", "writes": 1}})
+    db.execute("UPDATE usage SET day = '2000-01-01' WHERE account = 'acme'")
     save("acme")  # a new day: allowed again
 
 
@@ -134,7 +135,7 @@ def test_total_memories_are_limited(store, devs):
 def test_this_laptops_agents_have_no_write_limits(store):
     for _ in range(5):
         save("local", agent="alice")
-    assert not m.USAGE_FILE.exists()
+    assert db.query("SELECT count(*) FROM usage")[0][0] == 0
 
 
 @pytest.mark.parametrize("kw, error", [

@@ -5,7 +5,8 @@ import json
 import pytest
 
 import memoria as m
-from conftest import settle
+import db
+from conftest import index, save_index, settle
 
 
 def run(coro):
@@ -16,10 +17,6 @@ def save(agent="alice", note="Penguins huddle to survive the Antarctic winter.",
     kw.setdefault("reason", "test")
     kw.setdefault("topic", "test/animals")
     return run(m.save_memory(agent, note, **kw))
-
-
-def index():
-    return json.loads(m.INDEX_FILE.read_text(encoding="utf-8"))
 
 
 # ---------- saving ----------
@@ -63,7 +60,7 @@ def test_activity_and_agents_are_recorded(store):
     run(m.find_memory("bob", "penguins"))
     actions = [json.loads(line)["action"] for line in m.ACTIVITY_FILE.read_text().splitlines()]
     assert actions[:2] == ["save", "find"]
-    assert set(json.loads(m.AGENTS_FILE.read_text())) == {"alice", "bob"}
+    assert {row["principal"] for row in db.query("SELECT principal FROM agents")} == {"alice", "bob"}
 
 
 # ---------- privacy and sharing ----------
@@ -165,7 +162,7 @@ def test_editing_the_file_breaks_the_signature(store):
     mid = save()["memory_id"]
     data = index()
     data[mid]["note"] = "Someone quietly changed this."
-    m._write_json(m.INDEX_FILE, data)
+    save_index(data)
     shown = next(x for x in m.all_memories() if x["memory_id"] == mid)
     assert shown["verification"] == "NOT verified"
     assert "changed after it was signed" in shown["verification_detail"]
@@ -181,6 +178,6 @@ def test_unsigned_memory_is_reported(store):
     mid = save()["memory_id"]
     data = index()
     del data[mid]["signature"]
-    m._write_json(m.INDEX_FILE, data)
+    save_index(data)
     shown = m.all_memories()[0]
     assert shown["verification"] == "NOT verified" and "no signature" in shown["verification_detail"]

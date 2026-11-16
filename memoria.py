@@ -18,15 +18,14 @@ The signature covers the memory's content and authorship labels (ID, topic,
 confidence, note, reason, who wrote it and when) but not its sharing settings.
 
 Where things are kept (all inside the memory_store folder):
-  - Cognee's databases: the memories themselves plus the knowledge graph
-    Cognee builds from them (used for searching).
-  - memories.json: a simple list of every memory and its labels and history,
-    so labels are always exact and memories can be updated by ID.
-  - agents.json: every agent ID that has used Memoria.
+  - memoria.db: Memoria's database (see db.py): every memory with its labels,
+    signature and history, the agents, each account's usage and the list of
+    deleted memories still to be removed from Cognee.
+  - Cognee's databases: the memories again, plus the knowledge graph Cognee
+    builds from them (used for searching).
   - activity.log: who saved, searched or updated what, and when.
-  - pending_forget.json: deleted memories still waiting to be removed from Cognee.
 
-Saving is fast: save, update and delete only change memories.json and answer
+Saving is fast: save, update and delete only change Memoria's database and answer
 straight away. A background worker then does the slow part (Cognee reading the
 memory with Gemini and adding it to the knowledge graph), one job at a time,
 grouping memories that arrive together into one run. Until it is done the
@@ -43,16 +42,13 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import accounts
+import db
 import identity
 from setup_cognee import STORE, cognee
 from cognee import SearchType
 
 DATASET = "memoria"
-INDEX_FILE = STORE / "memories.json"
-AGENTS_FILE = STORE / "agents.json"
 ACTIVITY_FILE = STORE / "activity.log"
-FORGET_FILE = STORE / "pending_forget.json"
-USAGE_FILE = STORE / "usage.json"  # each developer account's writes today (for its limits)
 LOCAL = identity.LOCAL
 
 CONFIDENCE_LEVELS = ("low", "medium", "high")
@@ -64,7 +60,7 @@ MAX_LENGTHS = {"note": 4000, "new_note": 4000, "reason": 2000, "topic": 100, "qu
                "memory_id": 40}
 MAX_SHARED_WITH = 20
 
-_write_lock = asyncio.Lock()  # one change to memories.json at a time
+_write_lock = asyncio.Lock()  # one change to memories at a time
 _cognee_lock = asyncio.Lock()  # held by the background worker while it changes Cognee
 FORGET_GIVE_UP = 5  # stop retrying a Cognee removal after this many failures
 
@@ -77,19 +73,6 @@ class MemoriaError(ValueError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _read_json(path, default):
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return default
-
-
-def _write_json(path, value) -> None:
-    STORE.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)  # swap in one step so the file is never half-written
 
 
 def _log(agent_id: str, action: str, **details) -> None:
@@ -116,10 +99,7 @@ def check_agent(agent_id: str, account: str = LOCAL) -> str:
             "agent_id must be 2-40 characters: lowercase letters, numbers and dashes "
             "(for example 'claude-code' or 'research-bot')."
         )
-    agents = _read_json(AGENTS_FILE, {})
-    info = agents.setdefault(identity.principal(account, agent_id), {"first_seen": _now()})
-    info["last_seen"] = _now()
-    _write_json(AGENTS_FILE, agents)
+    db.touch_agent(identity.principal(account, agent_id), _now())
     return agent_id
 
 
@@ -175,7 +155,7 @@ def _require(value: str, name: str) -> str:
     return value
 
 
-def _use_quota(index: dict, account: str, new_memory: bool) -> None:
+def _use_quota(account: str, new_memory: bool) -> None:
     """Spam protection for developer accounts: refuse writes over the account's limits.
 
     Call while holding _write_lock. This laptop's own agents have no limits.
@@ -183,22 +163,12 @@ def _use_quota(index: dict, account: str, new_memory: bool) -> None:
     limit = accounts.limits(account)
     if limit is None:
         return
-    if new_memory:
-        count = sum(1 for m in index.values() if account_of(m) == account)
-        if count >= limit["max_memories"]:
-            raise MemoriaError(f"This account has reached its limit of {limit['max_memories']:,} "
-                               "memories. Delete some, or ask the host for a higher limit.")
-    usage = _read_json(USAGE_FILE, {})
-    today = _now()[:10]
-    used = usage.get(account)
-    if not used or used["day"] != today:
-        used = {"day": today, "writes": 0}
-    if used["writes"] >= limit["writes_per_day"]:
+    if new_memory and db.count_memories(account) >= limit["max_memories"]:
+        raise MemoriaError(f"This account has reached its limit of {limit['max_memories']:,} "
+                           "memories. Delete some, or ask the host for a higher limit.")
+    if not db.use_write(account, _now()[:10], limit["writes_per_day"]):
         raise MemoriaError(f"This account has used its {limit['writes_per_day']:,} saves and "
                            "updates for today. The limit resets at midnight (UTC).")
-    used["writes"] += 1
-    usage[account] = used
-    _write_json(USAGE_FILE, usage)
 
 
 def _as_text(mem: dict) -> str:
@@ -296,10 +266,8 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
     _sign(mem, who)  # prove this agent wrote it
     _mark_changed(mem)  # the background worker adds it to Cognee
     async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        _use_quota(index, account, new_memory=True)
-        index[mem["id"]] = mem
-        _write_json(INDEX_FILE, index)
+        _use_quota(account, new_memory=True)
+        db.put_memory(mem)
     _log(who, "save", memory_id=mem["id"], topic=mem["topic"])
     _kick()
     return _public(mem)
@@ -311,11 +279,8 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
     agent_id = check_agent(agent_id, account)
     query = _require(query, "query")
     limit = max(1, min(int(limit or 5), 20))
-    index = _read_json(INDEX_FILE, {})
     _log(identity.principal(account, agent_id), "find", query=query, topic=topic, saved_by=saved_by)
     _kick()  # finish any work left over from before Memoria was restarted
-    if not index:
-        return []
 
     def wanted(mem: dict) -> bool:
         if not can_see(mem, agent_id, account):  # never show memories this agent isn't allowed to read
@@ -326,41 +291,40 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
             return False
         return True
 
-    by_data_id = {m["data_id"]: m for m in index.values()
-                  if m.get("data_id") and account_of(m) == account}
     found: list[dict] = []
 
     # 1. Ask Cognee for the stored passages closest in meaning to the question.
-    #    (If nothing has been processed yet, Cognee has no search data, so skip it.)
-    if by_data_id:
+    #    (If none of this account's memories are in Cognee yet, there's nothing to search.)
+    if db.has_searchable(account):
         results = await cognee.search(
             query, query_type=SearchType.CHUNKS, datasets=[dataset_for(account)],
             top_k=max(50, limit * 10)
         )
-        for chunk in _chunks(results):
+        chunks = _chunks(results)
+        by_data_id = db.memories_by_data_id(account, [str(c.get("document_id")) for c in chunks])
+        for chunk in chunks:
             mem = by_data_id.get(str(chunk.get("document_id")))
             if mem is None:  # fall back to the memory ID written in the text
                 match = re.search(r"Memoria memory (mem-[0-9a-f]{8})", chunk.get("text", ""))
-                mem = index.get(match.group(1)) if match else None
+                mem = db.get_memory(match.group(1)) if match else None
             if mem and mem not in found and wanted(mem):
                 found.append(mem)
 
     # 2. Memories still being processed aren't in Cognee's search yet (or only in their
     #    old version): find them by the words of the question instead.
     words = _words(query)
-    for mem in index.values():
-        if mem.get("needs_sync") and mem not in found and wanted(mem) \
+    for mem in db.visible_memories(account, agent_id, waiting=True, topic=topic,
+                                   saved_by=saved_by):
+        if mem not in found and wanted(mem) \
                 and words & _words(f"{mem['topic']} {mem['note']} {mem['reason']}"):
             found.append(mem)
 
     # 3. If a topic was given, top up with the newest memories on that topic.
     if topic and len(found) < limit:
-        same_topic = sorted(
-            (m for m in index.values() if wanted(m) and m not in found),
-            key=lambda m: m.get("updated_at") or m["created_at"],
-            reverse=True,
-        )
-        found += same_topic
+        for mem in db.visible_memories(account, agent_id, topic=topic, saved_by=saved_by,
+                                       limit=limit + len(found)):
+            if mem not in found and wanted(mem):
+                found.append(mem)
 
     return [_public(m) for m in found[:limit]]
 
@@ -393,14 +357,13 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         topic = _require(topic, "topic")
 
     async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        mem = index.get(memory_id)
+        mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
-        _use_quota(index, account, new_memory=False)
+        _use_quota(account, new_memory=False)
 
         # Keep the old version in the history so nothing is lost.
-        mem["history"].append({
+        mem.setdefault("history", []).append({
             "note": mem["note"], "reason": mem["reason"], "confidence": mem["confidence"],
             "topic": mem["topic"], "replaced_at": _now(), "replaced_by": agent_id,
         })
@@ -414,9 +377,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         mem["updated_by"] = agent_id
         _sign(mem, who)  # the new version is signed by the agent that changed it
         _mark_changed(mem)  # the background worker updates it in Cognee
-
-        index[memory_id] = mem
-        _write_json(INDEX_FILE, index)
+        db.put_memory(mem)
     _log(who, "update", memory_id=memory_id)
     _kick()
     out = _public(mem)
@@ -431,8 +392,7 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
     agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        mem = index.get(memory_id)
+        mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
         if mem["agent_id"] != agent_id:
@@ -441,8 +401,7 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
             )
         before = (mem.get("visibility", "private"), mem.get("shared_with", []))
         mem["visibility"], mem["shared_with"] = _check_sharing(visibility, shared_with, agent_id)
-        index[memory_id] = mem
-        _write_json(INDEX_FILE, index)
+        db.put_memory(mem)
     _log(identity.principal(account, agent_id), "share", memory_id=memory_id,
          before={"visibility": before[0], "shared_with": before[1]},
          after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
@@ -456,27 +415,26 @@ async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
     agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        mem = index.get(memory_id)
+        mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'.")
         if mem["agent_id"] != agent_id:
             raise MemoriaError(
                 f"Only the agent that wrote this memory ('{mem['agent_id']}') can delete it."
             )
-        del index[memory_id]
-        _write_json(INDEX_FILE, index)
-        # The background worker removes it from Cognee (text, search data and graph).
-        # If it was never added to Cognee, the worker notices that and skips it.
-        if mem.get("data_id"):
-            _queue_forget(mem["data_id"], mem["dataset_id"], memory_id)
+        with db.transaction():
+            db.remove_memory(memory_id)
+            # The background worker removes it from Cognee (text, search data and graph).
+            # If it was never added to Cognee, the worker notices that and skips it.
+            if mem.get("data_id"):
+                db.queue_forget(mem["data_id"], mem["dataset_id"], memory_id)
     _log(identity.principal(account, agent_id), "delete", memory_id=memory_id, topic=mem["topic"],
          **({"via": via} if via else {}))
     _kick()
     return {"deleted": memory_id}
 
 
-# ---------- the background worker: keeps Cognee in step with memories.json ----------
+# ---------- the background worker: keeps Cognee in step with Memoria's database ----------
 #
 # Every memory has two bookkeeping fields:
 #   needs_sync:   True while Cognee doesn't have its latest version yet.
@@ -490,19 +448,6 @@ _worker: asyncio.Task | None = None
 def _mark_changed(mem: dict) -> None:
     mem["needs_sync"] = True
     mem["sync_version"] = mem.get("sync_version", 0) + 1
-
-
-def _queue_forget(data_id: str, dataset_id: str, memory_id: str) -> None:
-    """Note that Cognee should remove this item. Call while holding _write_lock."""
-    pending = _read_json(FORGET_FILE, [])
-    pending.append({"data_id": data_id, "dataset_id": dataset_id,
-                    "memory_id": memory_id, "attempts": 0})
-    _write_json(FORGET_FILE, pending)
-
-
-def _has_work() -> bool:
-    return (any(m.get("needs_sync") for m in _read_json(INDEX_FILE, {}).values())
-            or bool(_read_json(FORGET_FILE, [])))
 
 
 def _kick() -> None:
@@ -526,7 +471,7 @@ async def paused():
 
 def start_background_work() -> None:
     """Called when Memoria starts: finish any work left from last time."""
-    if _has_work():
+    if db.has_work():
         _kick()
 
 
@@ -539,7 +484,7 @@ def _background_error(what: str, error: Exception) -> None:
 async def _work_loop() -> None:
     """Keep working until everything is in Cognee. On failure, wait and try again."""
     wait = 15
-    while _has_work():
+    while db.has_work():
         async with _cognee_lock:  # a backup can pause the worker between passes
             succeeded = await _work_once()
         if succeeded:
@@ -554,33 +499,20 @@ async def _work_once() -> bool:
     ok = True
 
     # 1. Remove deleted memories from Cognee.
-    async with _write_lock:
-        to_forget = _read_json(FORGET_FILE, [])
-    for item in to_forget:
+    for item in db.forget_queue():
         try:
             await cognee.forget(data_id=UUID(item["data_id"]),
                                 dataset_id=UUID(item["dataset_id"]))
-            removed, gave_up = True, False
+            removed = True
         except Exception as e:
             _background_error(f"removing {item['memory_id']}", e)
             ok, removed = False, False
-            gave_up = item["attempts"] + 1 >= FORGET_GIVE_UP
-        async with _write_lock:
-            pending = _read_json(FORGET_FILE, [])
-            for entry in pending:
-                if entry["data_id"] == item["data_id"]:
-                    entry["attempts"] += 1
-            if removed or gave_up:  # done (or hopeless): stop trying
-                pending = [e for e in pending if e["data_id"] != item["data_id"]]
-                if gave_up:
-                    _log("memoria", "background_gave_up", memory_id=item["memory_id"])
-            _write_json(FORGET_FILE, pending)
+        if db.forget_tried(item["data_id"], done=removed, give_up_after=FORGET_GIVE_UP):
+            _log("memoria", "background_gave_up", memory_id=item["memory_id"])
 
     # 2. Send new and changed memories to Cognee.
-    async with _write_lock:
-        todo = [dict(m) for m in _read_json(INDEX_FILE, {}).values() if m.get("needs_sync")]
     added = []
-    for mem in todo:
+    for mem in db.waiting_memories():
         node_set = [f"account:{account_of(mem)}", f"agent:{mem['agent_id']}",
                     f"topic:{mem['topic']}"]
         try:
@@ -596,12 +528,15 @@ async def _work_once() -> bool:
                                              node_set=node_set)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(result["error"])
-                await _mark_done(mem, processed=True)
+                db.mark_synced(mem["id"], mem["sync_version"], processed=True)
             else:
                 result = await cognee.add(_as_text(mem), dataset_name=dataset_for(account_of(mem)),
                                           node_set=node_set)
-                if await _record_added(mem, str(result.data_ids[0]), str(result.dataset_id)):
+                data_id, dataset_id = str(result.data_ids[0]), str(result.dataset_id)
+                if db.record_added(mem["id"], data_id, dataset_id, mem["sync_version"]):
                     added.append(mem)
+                else:  # deleted while being added: remove it from Cognee too
+                    db.queue_forget(data_id, dataset_id, mem["id"])
         except Exception as e:
             ok = False
             _background_error(f"storing {mem['id']}", e)
@@ -614,52 +549,20 @@ async def _work_once() -> bool:
             _background_error("building the knowledge graph", e)
             return False  # the memories stay "processing"; next pass tries again
         for mem in added:
-            await _mark_done(mem, processed=True)
+            db.mark_synced(mem["id"], mem["sync_version"], processed=True)
     return ok
-
-
-async def _record_added(mem: dict, data_id: str, dataset_id: str) -> bool:
-    """Remember where Cognee stored a new memory. False if it was deleted meanwhile."""
-    async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        current = index.get(mem["id"])
-        if current is None:  # deleted while being added: remove it from Cognee too
-            _queue_forget(data_id, dataset_id, mem["id"])
-            return False
-        current["data_id"], current["dataset_id"] = data_id, dataset_id
-        current["processed"] = False  # stored in Cognee, graph not built yet
-        current["added_version"] = mem.get("sync_version")  # the version Cognee now holds
-        _write_json(INDEX_FILE, index)
-        return True
-
-
-async def _mark_done(mem: dict, processed: bool = False) -> None:
-    """Mark the memory as fully in Cognee, unless it was changed again meanwhile."""
-    async with _write_lock:
-        index = _read_json(INDEX_FILE, {})
-        current = index.get(mem["id"])
-        if current is None:
-            return
-        if processed:  # Cognee has built the graph for the version it holds
-            current["processed"] = True
-        if current.get("sync_version") == mem.get("sync_version"):
-            current["needs_sync"] = False
-        _write_json(INDEX_FILE, index)
 
 
 # ---------- read-only views for the dashboard (the laptop owner sees everything) ----------
 
 def all_memories() -> list[dict]:
     """Every memory with its labels and signature check, newest first."""
-    index = _read_json(INDEX_FILE, {})
-    out = [_public(m) for m in index.values()]
-    out.sort(key=lambda m: m["updated_at"] or m["saved_at"], reverse=True)
-    return out
+    return [_public(m) for m in db.all_memories()]
 
 
 def memory_versions(memory_id: str) -> dict | None:
     """One memory plus every version of it, newest first."""
-    mem = _read_json(INDEX_FILE, {}).get(memory_id)
+    mem = db.get_memory(memory_id)
     if mem is None:
         return None
     versions = []

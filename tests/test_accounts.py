@@ -6,6 +6,7 @@ import pytest
 import accounts
 import identity
 import manage_accounts
+from conftest import everything_stored
 
 
 # ---------- accounts ----------
@@ -21,7 +22,7 @@ def test_only_a_hash_of_the_key_is_stored(keys):
     accounts.create_account("acme")
     key = accounts.create_key("acme", "trader")
     secret = key.split("_", 2)[2]
-    stored = accounts.ACCOUNTS_FILE.read_text()
+    stored = everything_stored()
     assert secret not in stored and accounts._hash(secret) in stored
 
 
@@ -144,7 +145,7 @@ def test_invite_works_once(keys):
         accounts.use_invite(code, "globex")
     with pytest.raises(accounts.AccountError, match="isn't valid"):
         accounts.use_invite("inv_made_up", "globex")
-    assert code not in accounts.ACCOUNTS_FILE.read_text()  # stored as a hash too
+    assert code not in everything_stored()  # stored as a hash too
 
 
 # ---------- manage_accounts.py ----------
@@ -184,16 +185,17 @@ def test_host_tool_explains_mistakes(keys):
         manage_accounts.main(["set-limit", "nobody", "writes_per_day", "lots"])
 
 
-def test_accounts_file_is_reread_when_changed_elsewhere(keys):
+def test_changes_made_by_another_program_are_seen_at_once(keys):
     """manage_accounts.py runs separately from Memoria; Memoria must see its changes."""
+    import sqlite3
+
+    import db
     accounts.create_account("acme")
     key = accounts.create_key("acme", "trader")
     assert accounts.check_key(key)
-    data = json.loads(accounts.ACCOUNTS_FILE.read_text())
-    data["accounts"]["acme"]["status"] = "disabled"
-    import os
-    import time
-    accounts.ACCOUNTS_FILE.write_text(json.dumps(data))
-    os.utime(accounts.ACCOUNTS_FILE, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    other_program = sqlite3.connect(db.DB_FILE)  # its own connection, like a second program
+    other_program.execute("UPDATE accounts SET status = 'disabled' WHERE id = 'acme'")
+    other_program.commit()
+    other_program.close()
     with pytest.raises(accounts.AccountError, match="disabled"):
         accounts.check_key(key)

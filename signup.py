@@ -87,7 +87,7 @@ async def app(scope, receive, send) -> None:
 
     try:
         if mode == "invite":
-            _check_invite(invite)
+            accounts.check_invite(invite)  # fail before making the account
         accounts.create_account(account, email=email)
         if mode == "invite":
             accounts.use_invite(invite, account)
@@ -102,11 +102,3 @@ async def app(scope, receive, send) -> None:
         "message": "Keep this API key safe: it is shown only once.",
     })
 
-
-def _check_invite(code: str) -> None:
-    """Fail early (before making the account) if the invite can't be used."""
-    invite = accounts.load()["invites"].get(accounts._hash(code))
-    if invite is None:
-        raise accounts.AccountError("That invite code isn't valid.")
-    if invite["used_by"]:
-        raise accounts.AccountError("That invite code has already been used.")
