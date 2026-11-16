@@ -1,24 +1,33 @@
 """Agent identity for Memoria: Ed25519 keys, login passes and signatures.
 
 Every registered agent has:
-  - a SECRET key: keys/<agent>.key, encrypted with Windows DPAPI so it only
-    works for your Windows account on this laptop. Never uploaded to GitHub.
+  - a SECRET key, never uploaded to GitHub:
+      * this laptop's own agents: keys/<agent>.key, encrypted with Windows DPAPI so
+        it only works for your Windows account on this laptop.
+      * agents of developer accounts (for hosting online): keys/<account>/<agent>.key,
+        encrypted with the server secret MEMORIA_SECRET_KEY (works on any computer
+        that has that secret, e.g. a Linux server).
   - a PUBLIC key: listed in keys/public_keys.json. Anyone can use it to check
     that agent's signatures.
 
-Agents log in with a short-lived pass (a "token") signed with their secret key.
+An agent's full name (its "principal") is just "<agent>" for this laptop's own
+agents (the built-in "local" account) and "<account>/<agent>" for developer accounts.
+
+This laptop's agents log in with a short-lived pass (a "token") signed with their
+secret key. Developer accounts' agents log in with API keys instead (accounts.py).
 This file deliberately does not import Cognee, so making a pass is fast.
 """
 import base64
 import ctypes
-import ctypes.wintypes as wt
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -31,6 +40,13 @@ AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 TOKEN_LIFETIME = 3600  # a login pass is valid for 1 hour
 CLOCK_SLACK = 300      # allow clocks to be up to 5 minutes apart
 _DPAPI_ENTROPY = b"memoria-agent-key-v1"
+LOCAL = "local"            # the built-in account for this laptop's own agents
+SEALED = "sealed-v1:"      # start of a secret key encrypted with MEMORIA_SECRET_KEY
+
+try:  # Windows only; on other computers only sealed keys are used
+    import ctypes.wintypes as wt
+except (ImportError, ValueError):
+    wt = None
 
 
 class IdentityError(ValueError):
@@ -54,10 +70,71 @@ def _check_id(agent_id: str) -> str:
     return agent_id
 
 
+def principal(account: str, agent_id: str) -> str:
+    """An agent's full name: "trader" for this laptop's agents, "acme/trader" otherwise."""
+    return agent_id if account == LOCAL else f"{account}/{agent_id}"
+
+
+def split_principal(name: str) -> tuple[str, str]:
+    """The reverse of principal(): (account, agent)."""
+    account, _, agent = name.rpartition("/")
+    return (account or LOCAL), agent
+
+
+def _check_principal(name: str) -> str:
+    name = (name or "").strip().lower()
+    account, agent = split_principal(name)
+    if name.count("/") > 1 or not AGENT_ID_PATTERN.match(agent)             or not AGENT_ID_PATTERN.match(account) or (account == LOCAL and "/" in name):
+        raise IdentityError("Agent IDs are 2-40 lowercase letters, numbers and dashes.")
+    return name
+
+
+def _key_file(name: str) -> Path:
+    account, agent = split_principal(name)
+    folder = KEYS_DIR if account == LOCAL else KEYS_DIR / account
+    return folder / f"{agent}.key"
+
+
+# ---------- the server secret: encrypts developer accounts' agent keys ----------
+
+def _server_secret() -> Fernet:
+    secret = os.environ.get("MEMORIA_SECRET_KEY", "").strip()
+    if not secret:
+        raise IdentityError("MEMORIA_SECRET_KEY isn't set. Make one with "
+                            "'manage_accounts.py make-secret' and put it in .env.")
+    try:
+        return Fernet(secret)
+    except ValueError:
+        raise IdentityError("MEMORIA_SECRET_KEY isn't a valid secret. Make one with "
+                            "'manage_accounts.py make-secret'.") from None
+
+
+def make_server_secret() -> str:
+    return Fernet.generate_key().decode()
+
+
+def _lock(raw: bytes, name: str) -> str:
+    """Encrypt a secret key for storing on disk."""
+    if split_principal(name)[0] == LOCAL:
+        return _b64(_dpapi(raw, encrypt=True))
+    return SEALED + _server_secret().encrypt(raw).decode()
+
+
+def _unlock(text: str) -> bytes:
+    if text.startswith(SEALED):
+        try:
+            return _server_secret().decrypt(text[len(SEALED):].encode())
+        except InvalidToken:
+            raise IdentityError("This agent's key was locked with a different "
+                                "MEMORIA_SECRET_KEY.") from None
+    return _dpapi(_unb64(text), encrypt=False)
+
+
 # ---------- Windows DPAPI: encrypt secret keys for this Windows account ----------
 
-class _Blob(ctypes.Structure):
-    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+if wt is not None:
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
 def _blob(data: bytes):
@@ -66,6 +143,8 @@ def _blob(data: bytes):
 
 
 def _dpapi(data: bytes, encrypt: bool) -> bytes:
+    if wt is None:
+        raise IdentityError("This laptop's agent keys only work on Windows.")
     inp, _keep1 = _blob(data)
     ent, _keep2 = _blob(_DPAPI_ENTROPY)
     out = _Blob()
@@ -99,11 +178,10 @@ def public_key_of(agent_id: str) -> str | None:
 
 
 def register_agent(agent_id: str) -> str:
-    """Create a key pair for a new agent. Returns its public key."""
-    agent_id = _check_id(agent_id)
-    KEYS_DIR.mkdir(exist_ok=True)
+    """Create a key pair for a new agent ("trader" or "acme/trader"). Returns its public key."""
+    agent_id = _check_principal(agent_id)
     registry = _registry()
-    key_file = KEYS_DIR / f"{agent_id}.key"
+    key_file = _key_file(agent_id)
     if agent_id in registry or key_file.exists():
         raise IdentityError(f"'{agent_id}' is already registered.")
 
@@ -113,7 +191,9 @@ def register_agent(agent_id: str) -> str:
                                       serialization.NoEncryption())
     public = _b64(secret.public_key().public_bytes(serialization.Encoding.Raw,
                                                    serialization.PublicFormat.Raw))
-    key_file.write_text(_b64(_dpapi(raw_secret, encrypt=True)), encoding="utf-8")
+    locked = _lock(raw_secret, agent_id)  # before creating anything, in case it fails
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_text(locked, encoding="utf-8")
     registry[agent_id] = {
         "public_key": public,
         "registered_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -125,10 +205,10 @@ def register_agent(agent_id: str) -> str:
 
 
 def _secret_key(agent_id: str) -> Ed25519PrivateKey:
-    key_file = KEYS_DIR / f"{agent_id}.key"
+    key_file = _key_file(agent_id)
     if not key_file.exists():
-        raise IdentityError(f"'{agent_id}' is not registered (no secret key on this laptop).")
-    raw = _dpapi(_unb64(key_file.read_text(encoding="utf-8").strip()), encrypt=False)
+        raise IdentityError(f"'{agent_id}' is not registered (no secret key on this computer).")
+    raw = _unlock(key_file.read_text(encoding="utf-8").strip())
     return Ed25519PrivateKey.from_private_bytes(raw)
 
 
@@ -152,6 +232,8 @@ def check_token(token: str) -> str:
         raise IdentityError("Login pass is missing or malformed.") from None
     if version != "v1":
         raise IdentityError("Unknown login pass version.")
+    if not AGENT_ID_PATTERN.match(agent_id):  # login passes are for this laptop's agents only
+        raise IdentityError("Login pass is missing or malformed.")
     public = public_key_of(agent_id)
     if public is None:
         raise IdentityError(f"'{agent_id}' is not a registered agent.")

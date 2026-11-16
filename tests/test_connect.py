@@ -5,44 +5,17 @@ talk to it the way a real agent would.
 """
 import asyncio
 import json
-import socket
-import threading
 import time
 
 import pytest
-import uvicorn
 from mcp import types
 
 import connect_agent
 import identity
 import memoria_bridge
 import memoria_client
-import server
+from conftest import free_port
 from memoria_client import Memoria
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def memoria_url(store):
-    """A real Memoria agents' server on a spare port. Returns its address."""
-    port = free_port()
-    app = server.LoginCheck(server.mcp.streamable_http_app(host="127.0.0.1"))
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", lifespan="on")
-    web = uvicorn.Server(config)
-    thread = threading.Thread(target=web.run, daemon=True)
-    thread.start()
-    for _ in range(100):
-        if web.started:
-            break
-        time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}/mcp"
-    web.should_exit = True
-    thread.join(timeout=10)
 
 
 def run(coro):

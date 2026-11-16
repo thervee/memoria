@@ -76,7 +76,7 @@ def test_memory_whose_author_key_is_missing_cant_be_changed(client, keys):
     mid = save(agent="carol")["memory_id"]
     (keys / "carol.key").unlink()
     r = client.post(f"/dashboard/api/memories/{mid}/delete", headers=SAME_ORIGIN)
-    assert r.status_code == 400 and "key isn't on this laptop" in r.json()["message"]
+    assert r.status_code == 400 and "key isn't on this computer" in r.json()["message"]
 
 
 def test_oversized_and_bad_requests_are_refused(client):

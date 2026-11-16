@@ -16,6 +16,11 @@ whenever the old one is close to expiring, so the agent never has to think about
     asyncio.run(main())
 
 The agent must be registered on this laptop first (connect_agent.bat does that).
+
+For a Memoria hosted online, use the API key the host gave you instead:
+
+    async with Memoria(api_key="mem_...", url="https://memoria.example.com/mcp") as mem:
+        ...
 """
 import json
 import sys
@@ -39,6 +44,20 @@ class MemoriaNotRunning(ConnectionError):
     """Memoria isn't answering at 127.0.0.1:8765."""
 
 
+class ApiKey(httpx2.Auth):
+    """Adds 'Authorization: Bearer <API key>' to every request (for a hosted Memoria)."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+
+    def token(self) -> str:
+        return self.api_key
+
+    def auth_flow(self, request):
+        request.headers["Authorization"] = f"Bearer {self.api_key}"
+        yield request
+
+
 class FreshPass(httpx2.Auth):
     """Adds 'Authorization: Bearer <login pass>' to every request, renewing it in time."""
 
@@ -57,8 +76,8 @@ class FreshPass(httpx2.Auth):
 
 
 @asynccontextmanager
-async def session(agent_id: str, url: str = URL, auth: FreshPass | None = None):
-    """An open MCP session with Memoria, logged in as agent_id."""
+async def session(agent_id: str | None = None, url: str = URL, auth=None):
+    """An open MCP session with Memoria, logged in as agent_id (or with `auth`)."""
     auth = auth or FreshPass(agent_id)
     auth.token()  # fail early, with a clear message, if the agent isn't registered
     try:
@@ -71,8 +90,11 @@ async def session(agent_id: str, url: str = URL, auth: FreshPass | None = None):
         # The MCP library runs several tasks at once and bundles their errors into a
         # group. Turn "couldn't connect" into one clear message, and unwrap single errors.
         if _contains(e, httpx2.ConnectError):
-            raise MemoriaNotRunning(
-                "Memoria isn't running. Start it by double-clicking start_memoria.bat.") from None
+            if url.startswith(("http://127.0.0.1", "http://localhost")):
+                message = "Memoria isn't running. Start it by double-clicking start_memoria.bat."
+            else:
+                message = f"Can't reach Memoria at {url}. Check the address and your connection."
+            raise MemoriaNotRunning(message) from None
         while isinstance(e, BaseExceptionGroup) and len(e.exceptions) == 1:
             e = e.exceptions[0]
         raise e
@@ -102,13 +124,16 @@ def _result(result):
 class Memoria:
     """Memoria's five tools as simple Python methods, for one agent."""
 
-    def __init__(self, agent_id: str, url: str = URL):
+    def __init__(self, agent_id: str | None = None, url: str = URL, api_key: str | None = None):
+        if not agent_id and not api_key:
+            raise ValueError("Give an agent_id (this laptop) or an api_key (hosted Memoria).")
         self.agent_id, self.url = agent_id, url
+        self.auth = ApiKey(api_key) if api_key else FreshPass(agent_id)
         self._session = None
         self._stack = None
 
     async def __aenter__(self):
-        self._stack = session(self.agent_id, self.url)
+        self._stack = session(self.agent_id, self.url, self.auth)
         self._session = await self._stack.__aenter__()
         return self
 

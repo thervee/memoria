@@ -3,6 +3,8 @@
 // so nothing an agent writes in a memory can run in this page.
 
 const $ = (selector) => document.querySelector(selector);
+// An agent's full name: "trader" for this laptop's agents, "acme/trader" for a developer account's.
+const author = (m) => (m.account === "local" ? m.saved_by : m.account + "/" + m.saved_by);
 const state = { memories: [], agents: [], current: null };
 
 // Build an element: h("div", {class: "x", onclick: fn}, "text", childElement, ...)
@@ -63,7 +65,7 @@ async function loadMemories() {
   const data = await api("/memories");
   state.memories = data.memories;
   state.agents = data.agents;
-  fillFilter("#filter-agent", "All agents", state.memories.map((m) => m.saved_by));
+  fillFilter("#filter-agent", "All agents", state.memories.map(author));
   fillFilter("#filter-topic", "All topics", state.memories.map((m) => m.topic));
   render();
 }
@@ -79,10 +81,10 @@ function fillFilter(selector, allLabel, values) {
 
 function matches(m) {
   const words = $("#search").value.toLowerCase().split(/\s+/).filter(Boolean);
-  const haystack = [m.note, m.reason, m.topic, m.saved_by, m.updated_by, m.memory_id]
+  const haystack = [m.note, m.reason, m.topic, author(m), m.updated_by, m.memory_id]
     .join(" ").toLowerCase();
   return words.every((w) => haystack.includes(w))
-    && (!$("#filter-agent").value || m.saved_by === $("#filter-agent").value)
+    && (!$("#filter-agent").value || author(m) === $("#filter-agent").value)
     && (!$("#filter-topic").value || m.topic === $("#filter-topic").value)
     && (!$("#filter-verified").value || m.verification === $("#filter-verified").value);
 }
@@ -107,7 +109,7 @@ function render() {
         confidenceBadge(m.confidence)),
       h("p", { class: "item-note" }, m.note),
       h("div", { class: "meta" },
-        h("span", {}, "By ", h("b", {}, m.saved_by)),
+        h("span", {}, "By ", h("b", {}, author(m))),
         h("span", {}, m.updated_at ? "Updated " + when(m.updated_at) : "Saved " + when(m.saved_at)),
         m.times_updated ? h("span", {}, m.times_updated + 1 + " versions") : null,
         h("span", { class: "mono" }, m.memory_id)));
@@ -135,7 +137,7 @@ async function openDetail(memoryId) {
     h("section", { class: "section" },
       h("h3", {}, "Details"),
       h("dl", { class: "facts" },
-        h("dt", {}, "Written by"), h("dd", {}, m.saved_by + " · " + when(m.saved_at)),
+        h("dt", {}, "Written by"), h("dd", {}, author(m) + " · " + when(m.saved_at)),
         m.updated_at ? [h("dt", {}, "Last updated"), h("dd", {}, m.updated_by + " · " + when(m.updated_at))] : null,
         h("dt", {}, "Signature"), h("dd", {}, m.verification + " (" + m.verification_detail + ")"),
         m.public_key ? [h("dt", {}, "Public key"), h("dd", { class: "mono" }, m.public_key)] : null,
@@ -161,7 +163,12 @@ async function openDetail(memoryId) {
 }
 
 function sharingSection(m) {
-  const others = state.agents.filter((a) => a !== m.saved_by);
+  // Only agents of the same account can be given access, by their short name.
+  const prefix = m.account === "local" ? "" : m.account + "/";
+  const others = state.agents
+    .filter((a) => (prefix ? a.startsWith(prefix) : !a.includes("/")))
+    .map((a) => a.slice(prefix.length))
+    .filter((a) => a !== m.saved_by);
   const radio = (value, label) => h("label", { class: "choice" },
     h("input", { type: "radio", name: "visibility", value, checked: m.visibility === value,
       onchange: syncAgents }), label);
@@ -172,7 +179,7 @@ function sharingSection(m) {
   const section = h("section", { class: "section" },
     h("h3", {}, "Sharing"),
     h("p", { class: "hint" },
-      `Changes are made as ${m.saved_by}, the agent that wrote this memory, using its own key.`),
+      `Changes are made as ${author(m)}, the agent that wrote this memory, using its own key.`),
     h("div", { class: "choices" }, radio("private", "🔒 Private"), radio("shared", "👥 Shared")),
     agentBoxes,
     others.length ? null : h("p", { class: "hint" }, "No other registered agents to share with."),
@@ -213,7 +220,7 @@ async function saveSharing(m, button) {
 function askDelete(m) {
   $("#confirm-text").textContent =
     `“${m.note.slice(0, 120)}${m.note.length > 120 ? "…" : ""}” (${m.memory_id}) will be removed `
-    + `for every agent. This can't be undone. It will be deleted as ${m.saved_by}, the agent that wrote it.`;
+    + `for every agent. This can't be undone. It will be deleted as ${author(m)}, the agent that wrote it.`;
   $("#confirm-yes").onclick = async () => {
     $("#confirm-yes").disabled = true;
     $("#confirm-no").disabled = true;

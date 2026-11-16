@@ -116,6 +116,12 @@ protect against someone who already controls Memoria and your Windows account on
 | `connect_agent.bat` / `connect_agent.py` | Connect a new agent: registers it and prints the setup to paste |
 | `memoria_bridge.py` | Lets any MCP app use Memoria as a command, with login passes handled for it |
 | `memoria_client.py` | Use Memoria from your own Python agents, with login passes handled for you |
+| `accounts.py` | Developer accounts, API keys, invite codes and per-account limits (for hosting) |
+| `manage_accounts.py` | The host's tool for creating accounts and API keys |
+| `limits.py` | Spam protection: requests per minute, wrong-key lock-outs, request size |
+| `signup.py` | Optional developer sign-up at `/signup` (off unless turned on) |
+| `memory_store/accounts.json` | Developer accounts and hashed API keys |
+| `memory_store/usage.json` | Each developer account's saves and updates today |
 | `dashboard.py` | The dashboard's server side (list, history, sharing, delete, and its safety checks) |
 | `dashboard/` | The dashboard webpage (`index.html`, `app.css`, `app.js`) |
 | `keys/` | **Agents' secret keys** and the public key list. Never shared or uploaded. |
@@ -160,11 +166,86 @@ kept. Delete that folder once you're happy with the restore.
 **Note:** backups cover `memory_store` only. Agents' keys live in the `keys` folder, which isn't in
 the backups. Without it, agents can't log in, and memories show NOT verified.
 
+## Hosting online (prepared, not deployed yet)
+Memoria is ready to serve other developers, each with their own account. **Nothing is online yet:**
+everything below is off or unused until you set it up on a server. On this laptop, nothing changes:
+your agents are in the built-in account `local` and log in with login passes as before.
+
+**Developer accounts and API keys** (`accounts.py`, `manage_accounts.py`)
+- Each developer has an **account** (e.g. `acme`) with up to 10 **agents** (e.g. `trader`).
+- Each **API key** belongs to one agent of one account. Agents send it as
+  `Authorization: Bearer mem_...`. A key can't act as another agent or see another account.
+- Only a hash of each key is stored (in `memory_store\accounts.json`), so the file can't be used to log
+  in. A key is shown once, when it's made.
+- Developers' agents still sign every memory. Their signing keys live in `keys\<account>\` and are
+  locked with a **server secret** (`MEMORIA_SECRET_KEY` in `.env`), because servers usually don't run
+  Windows. Back the secret up privately: without it those agents can't sign any more.
+
+**Each developer's memories are kept apart**
+- Agents only ever see memories of their own account. Sharing (`shared_with`) only reaches agents of the
+  same account: acme's `analyst` and globex's `analyst` are different agents.
+- Each account has its **own Cognee dataset** (`memoria-acme`), so a developer's searches never even
+  look at anyone else's memories.
+- The account is part of each memory's signature, so a memory moved to another account in the file
+  shows NOT verified.
+
+**Spam protection** (`limits.py`, and limits per account)
+| What | Default | Change it |
+|---|---|---|
+| Requests per minute, per agent | 60 | `set-limit <account> requests_per_minute <n>` |
+| Saves + updates per day, per account (each costs AI processing) | 200 | `set-limit <account> writes_per_day <n>` |
+| Memories kept, per account | 2,000 | `set-limit <account> max_memories <n>` |
+| Agents per account | 10 | `set-limit <account> max_agents <n>` |
+| Requests per minute, per internet address | 120 | `MEMORIA_IP_LIMIT` in `.env` |
+| Wrong API keys per address before a 10-minute lock-out | 10 | `MEMORIA_FAILED_LOGIN_LIMIT` |
+| Size of one request | 64 KB | `MEMORIA_MAX_REQUEST_BYTES` |
+| Length of a note / reason / topic / question | 4,000 / 2,000 / 100 / 1,000 characters | (fixed) |
+
+Going over a limit gets a clear message (and `429 Too Many Requests` with a `Retry-After` time for the
+per-minute limits). This laptop's own agents have no daily or per-minute limits.
+
+**Sign-up** (`signup.py`): off unless you turn it on with `MEMORIA_SIGNUP` in `.env`:
+- `off` (default): you create accounts yourself with `manage_accounts.py`.
+- `invite`: developers sign up with a one-time code you make with `manage_accounts.py invite`.
+- `open`: anyone can sign up.
+
+Developers send `POST /signup` with `{"account": "acme", "email": "dev@acme.example"}` (plus `"invite"`
+if needed) and get an API key back. Each address can try 3 times an hour, and at most 50 accounts are
+made per day in total.
+
+**Managing accounts** (run on the server): `python manage_accounts.py <command>`
+- `make-secret`: make the server secret for `.env`, once, before anything else.
+- `create acme --email dev@acme.example`, then `new-key acme trader`: make an account and an API key.
+- `list`, `revoke-key <key-id>`, `disable acme` / `enable acme`, `set-limit ...`, `invite`.
+
+**Connecting a developer's agent:** in an MCP app, run `memoria_bridge.py` with the environment variables
+`MEMORIA_API_KEY=mem_...` and `MEMORIA_URL=https://<your address>/mcp`. In Python, use
+`Memoria(api_key="mem_...", url="https://<your address>/mcp")`.
+
+**The dashboard stays private.** It shows every account's memories, so it only opens on the computer
+Memoria runs on. It refuses anything that came through a proxy, and you can turn it off with
+`MEMORIA_DASHBOARD=off`.
+
+**Still to do before going online** (not done yet, on purpose):
+1. Choose a server and run Memoria there behind a web server that adds HTTPS (a "reverse proxy").
+   Set `MEMORIA_TRUST_PROXY=1` so limits use each visitor's real address. Never expose Memoria without
+   HTTPS: API keys would travel in plain sight.
+2. Let Memoria accept connections from the proxy and your web address. It only listens on this computer
+   today (`127.0.0.1`), and the MCP server only accepts requests addressed to `127.0.0.1`.
+3. Make the server secret, set `MEMORIA_DASHBOARD=off`, and keep backups off the server.
+4. Check the Gemini plan: every save costs AI processing, and the free tier won't cover many developers.
+5. For many developers, move from JSON files to a database. Today every request reads `memories.json`,
+   which is fine for a handful of developers but gets slow with thousands of memories.
+6. Optional: email checks at sign-up, a page where developers manage their own keys, and terms of use
+   and a privacy notice (you'd be storing other people's data).
+
 ## Tests
-92 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+161 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
 who may delete, connecting agents (the bridge and Python helper), the background worker (including
-retries after failures), backups and restoring them, and the dashboard's safety checks. They take a few seconds, use a pretend Cognee (so no Gemini calls), and each one runs
-in its own temporary folder, so they never touch your real memories or keys.
+retries after failures), backups and restoring them, the dashboard's safety checks, and hosting:
+developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up.
+They take about 25 seconds, use a pretend Cognee (so no Gemini calls), and each one runs in its own
+temporary folder, so they never touch your real memories or keys.
 
 Run them (in PowerShell, in the Memoria folder):
 1. Once: `.venv\Scripts\python.exe -m pip install -r requirements-dev.txt`

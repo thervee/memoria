@@ -19,7 +19,8 @@ def test_register_creates_encrypted_secret_and_public_key(keys):
 def test_register_refuses_duplicates_and_bad_ids(keys):
     with pytest.raises(identity.IdentityError, match="already registered"):
         identity.register_agent("alice")
-    for bad in ("", "A", "Has Caps", "-starts-with-dash", "x" * 41, "bad/char"):
+    for bad in ("", "A", "Has Caps", "-starts-with-dash", "x" * 41, "bad\\char",
+                "too/many/parts", "local/sneaky", "/no-account", "acme/"):
         with pytest.raises(identity.IdentityError):
             identity.register_agent(bad)
 

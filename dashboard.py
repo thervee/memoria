@@ -13,8 +13,14 @@ Safety rules:
     because browsers don't hand them the answers.
   - Sharing changes and deletions are made AS the agent that wrote the memory,
     proven with that agent's own key, the same rule agents follow.
+  - It shows EVERY account's memories, so it must never be reachable from the
+    internet. When Memoria is hosted, a web server in front of it (a proxy) can make
+    outside requests look as if they come from this computer, so any request that
+    went through a proxy (it carries X-Forwarded-For or Forwarded) is refused.
+    Hosts can also turn the dashboard off completely with MEMORIA_DASHBOARD=off.
 """
 import json
+import os
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -40,6 +46,8 @@ def _error(status: int, message: str) -> JSONResponse:
 
 def _guard(request: Request) -> JSONResponse | None:
     """Return an error response if this request isn't allowed, else None."""
+    if any(h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip")):
+        return _error(403, "The dashboard only opens on the computer Memoria runs on.")
     if request.headers.get("host", "") not in ALLOWED_HOSTS:
         return _error(403, "Open the dashboard at http://127.0.0.1:8765/dashboard")
     if request.method != "GET":
@@ -60,20 +68,20 @@ async def _json_body(request: Request) -> dict:
     return data
 
 
-def _act_as_author(memory_id: str) -> str:
-    """The memory's author, after proving its secret key is on this laptop."""
+def _act_as_author(memory_id: str) -> tuple[str, str]:
+    """The memory's author and account, after proving the author's secret key is here."""
     mem = next((m for m in memoria.all_memories() if m["memory_id"] == memory_id), None)
     if mem is None:
         raise memoria.MemoriaError(f"No memory with ID '{memory_id}'.")
-    author = mem["saved_by"]
+    author, account = mem["saved_by"], mem["account"]
     try:
-        identity.check_token(identity.make_token(author))  # same login check agents pass
+        identity.sign(identity.principal(account, author), b"memoria-dashboard-check")
     except identity.IdentityError:
         raise memoria.MemoriaError(
-            f"This memory was written by '{author}', whose key isn't on this laptop, "
-            "so it can't be changed from here."
+            f"This memory was written by '{identity.principal(account, author)}', whose key "
+            "isn't on this computer, so it can't be changed from here."
         ) from None
-    return author
+    return author, account
 
 
 # ---------- pages and API ----------
@@ -116,9 +124,10 @@ async def change_sharing(request: Request):
     memory_id = request.path_params["memory_id"]
     try:
         data = await _json_body(request)
-        author = _act_as_author(memory_id)
+        author, account = _act_as_author(memory_id)
         result = await memoria.share_memory(author, memory_id, str(data.get("visibility", "")),
-                                            data.get("shared_with") or [], via="dashboard")
+                                            data.get("shared_with") or [], via="dashboard",
+                                            account=account)
     except (memoria.MemoriaError, ValueError) as e:
         return _error(400, str(e))
     return JSONResponse(result)
@@ -130,8 +139,9 @@ async def delete(request: Request):
         return blocked
     memory_id = request.path_params["memory_id"]
     try:
-        author = _act_as_author(memory_id)
-        result = await memoria.delete_memory(author, memory_id, via="dashboard")
+        author, account = _act_as_author(memory_id)
+        result = await memoria.delete_memory(author, memory_id, via="dashboard",
+                                             account=account)
     except memoria.MemoriaError as e:
         return _error(400, str(e))
     return JSONResponse(result)
@@ -168,5 +178,7 @@ async def app(scope, receive, send):
 
 
 def handles(path: str) -> bool:
-    """True for web addresses that belong to the dashboard."""
+    """True for web addresses that belong to the dashboard (none if it's turned off)."""
+    if os.environ.get("MEMORIA_DASHBOARD", "on").strip().lower() == "off":
+        return False
     return path == "/" or path == "/dashboard" or path.startswith("/dashboard/")
