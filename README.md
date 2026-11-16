@@ -106,6 +106,7 @@ protect against someone who already controls Memoria and your Windows account on
 | `.env` | Settings and your Gemini API key. **Keep private.** |
 | `setup_cognee.py` | Points Cognee at local storage |
 | `memoria.py` | The memory engine (save / find / update) and the background worker |
+| `db.py` | Memoria's database: where memories, agents and accounts are kept |
 | `requirements.txt` | Every package Memoria needs, with exact versions |
 | `requirements-dev.txt` | The extra package needed to run the tests (pytest) |
 | `tests/` | The automatic tests (`pytest.ini` holds their settings) |
@@ -120,8 +121,6 @@ protect against someone who already controls Memoria and your Windows account on
 | `manage_accounts.py` | The host's tool for creating accounts and API keys |
 | `limits.py` | Spam protection: requests per minute, wrong-key lock-outs, request size |
 | `signup.py` | Optional developer sign-up at `/signup` (off unless turned on) |
-| `memory_store/accounts.json` | Developer accounts and hashed API keys |
-| `memory_store/usage.json` | Each developer account's saves and updates today |
 | `dashboard.py` | The dashboard's server side (list, history, sharing, delete, and its safety checks) |
 | `dashboard/` | The dashboard webpage (`index.html`, `app.css`, `app.js`) |
 | `keys/` | **Agents' secret keys** and the public key list. Never shared or uploaded. |
@@ -133,10 +132,9 @@ protect against someone who already controls Memoria and your Windows account on
 | `backups/` | The automatic backups (private: never uploaded to GitHub) |
 | `backup.py` | Makes the daily backups and deletes the oldest ones |
 | `restore_backup.bat` / `restore_backup.py` | Double-click to put a backup back (Memoria must be stopped) |
-| `memory_store/memories.json` | Readable list of every memory, its labels and its history |
-| `memory_store/agents.json` | Every agent ID that has used Memoria |
+| `memory_store/memoria.db` | **Memoria's database** (see Database): memories, agents, accounts, API keys |
+| `memory_store/*.json.imported` | The older JSON files, kept after they were moved into the database |
 | `memory_store/activity.log` | Who saved, searched or updated what, and when (plus any background processing errors) |
-| `memory_store/pending_forget.json` | Deleted memories still waiting to be removed from Cognee's databases |
 
 ## Backups
 Memoria backs up `memory_store` by itself: when it starts (if the newest backup is more than a day
@@ -175,7 +173,7 @@ your agents are in the built-in account `local` and log in with login passes as 
 - Each developer has an **account** (e.g. `acme`) with up to 10 **agents** (e.g. `trader`).
 - Each **API key** belongs to one agent of one account. Agents send it as
   `Authorization: Bearer mem_...`. A key can't act as another agent or see another account.
-- Only a hash of each key is stored (in `memory_store\accounts.json`), so the file can't be used to log
+- Only a hash of each key is stored (in Memoria's database), so a copy of it can't be used to log
   in. A key is shown once, when it's made.
 - Developers' agents still sign every memory. Their signing keys live in `keys\<account>\` and are
   locked with a **server secret** (`MEMORIA_SECRET_KEY` in `.env`), because servers usually don't run
@@ -234,16 +232,35 @@ Memoria runs on. It refuses anything that came through a proxy, and you can turn
    today (`127.0.0.1`), and the MCP server only accepts requests addressed to `127.0.0.1`.
 3. Make the server secret, set `MEMORIA_DASHBOARD=off`, and keep backups off the server.
 4. Check the Gemini plan: every save costs AI processing, and the free tier won't cover many developers.
-5. For many developers, move from JSON files to a database. Today every request reads `memories.json`,
-   which is fine for a handful of developers but gets slow with thousands of memories.
-6. Optional: email checks at sign-up, a page where developers manage their own keys, and terms of use
+5. Optional: email checks at sign-up, a page where developers manage their own keys, and terms of use
    and a privacy notice (you'd be storing other people's data).
 
+## Database
+Memoria keeps its own records in one database file, `memory_store\memoria.db` (SQLite: a full
+database in a single file, built into Python, with nothing to install or run).
+- **What's in it:** every memory with its labels, signature, sharing and history; the agents; developer
+  accounts, hashed API keys and invite codes; each account's usage today; and deleted memories still
+  waiting to be removed from Cognee. The activity log stays a plain text file (`activity.log`).
+- **Why:** finding one memory or one API key no longer means reading every memory, so it stays quick
+  with many developers and thousands of memories. It's also safe when two programs use it at once
+  (Memoria and `manage_accounts.py`), and every change either happens completely or not at all.
+- **Your older files were moved in automatically** the first time Memoria started with the database.
+  The originals are kept as `memories.json.imported` (and so on) and are never read again. Delete them
+  whenever you like.
+- **Backups copy it safely:** SQLite's own backup feature makes the copy, so it's complete and
+  consistent even while Memoria is using the database. Restoring works the same as before.
+- **Later, if needed:** a very busy service could move to a database server (e.g. Postgres). All of
+  Memoria's database code is in `db.py` and `accounts.py`, so only those two files would change.
+- **Don't edit it by hand while Memoria runs.** Use the dashboard, the agents' tools or
+  `manage_accounts.py`. To look inside, any SQLite viewer works (e.g. "DB Browser for SQLite").
+
 ## Tests
-161 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+174 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
 who may delete, connecting agents (the bridge and Python helper), the background worker (including
 retries after failures), backups and restoring them, the dashboard's safety checks, and hosting:
-developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up.
+developer accounts and API keys, keeping each developer's memories apart, spam protection and sign-up,
+and the database: importing the older files, surviving restarts, two programs at once, using indexes
+instead of reading everything, and backups never catching a change halfway.
 They take about 25 seconds, use a pretend Cognee (so no Gemini calls), and each one runs in its own
 temporary folder, so they never touch your real memories or keys.
 

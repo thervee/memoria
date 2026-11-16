@@ -1,6 +1,7 @@
 """Automatic backups (backup.py) and restoring them (restore_backup.py)."""
 import asyncio
 import json
+import sqlite3
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -30,8 +31,7 @@ def backups(tmp_path, monkeypatch):
 def fill_store(store):
     """A small memory store with the kinds of files a real one has."""
     files = {
-        "memories.json": '{"mem-1": {}, "mem-2": {}}',
-        "agents.json": "{}",
+        "agents.json.imported": "{}",
         "activity.log": "{}\n",
         "data/abc/text_1.txt": "a memory",
         "system/databases/cognee_db": "sqlite bytes",
@@ -45,6 +45,13 @@ def fill_store(store):
         "system/pipeline_run_locks/run.lock": "",
         "memories.tmp": "half written",
     }
+    store.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(store / "memoria.db")  # Memoria's database, with 2 memories
+    database.execute("CREATE TABLE memories (id TEXT)")
+    database.executemany("INSERT INTO memories VALUES (?)", [("mem-1",), ("mem-2",)])
+    database.commit()
+    database.close()
+    (store / "memoria.db-wal").write_text("")  # copied via SQLite, never as a plain file
     for name, text in files.items():
         path = store / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +72,8 @@ def test_backup_keeps_memories_and_databases_but_not_re_creatable_files(tmp_path
     assert path.name == "memoria-backup-2026-11-16_103000.zip"
     assert names(path) == {
         "backup_info.json",
-        "memory_store/memories.json", "memory_store/agents.json", "memory_store/activity.log",
+        "memory_store/memoria.db", "memory_store/agents.json.imported",
+        "memory_store/activity.log",
         "memory_store/data/abc/text_1.txt",
         "memory_store/system/databases/cognee_db",
         "memory_store/system/databases/abc/graph.lbug",
@@ -195,7 +203,9 @@ def test_restore_brings_memories_back_and_keeps_the_old_store(store, backups):
     assert [x["memory_id"] for x in restored] == [mid]
     assert restored[0]["verification"] == "verified"  # signatures survive the round trip
     assert (m.STORE / "models" / "model.onnx").exists()  # model moved across, not re-downloaded
-    assert json.loads((kept / "memories.json").read_text()) == {}  # old store kept as it was
+    old = sqlite3.connect(kept / "memoria.db")  # the old store is kept as it was
+    assert old.execute("SELECT count(*) FROM memories").fetchone()[0] == 0
+    old.close()
 
 
 def test_restore_refuses_files_that_would_land_outside_the_store(tmp_path):

@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import accounts  # noqa: E402
+import db  # noqa: E402
 import identity  # noqa: E402
 import limits  # noqa: E402
 import memoria  # noqa: E402
@@ -39,6 +40,7 @@ class FakeCognee:
         self.calls = []       # names of the calls made, in order
         self.searched = []    # the datasets each search asked for
         self.fail = {}        # call name -> how many more times it should fail
+        self.during_add = None  # something to do while an add is "in progress"
 
     def _call(self, name):
         self.calls.append(name)
@@ -48,6 +50,9 @@ class FakeCognee:
 
     async def add(self, text, dataset_name, node_set):
         self._call("add")
+        if self.during_add:
+            hook, self.during_add = self.during_add, None
+            await hook()
         data_id = uuid.uuid4()
         self.docs[str(data_id)] = {"text": text, "processed": False, "dataset": dataset_name}
         return SimpleNamespace(data_ids=[data_id],
@@ -91,6 +96,7 @@ def clean_settings(monkeypatch):
     limits.reset_all()
     yield
     limits.reset_all()
+    db.close()
 
 
 @pytest.fixture
@@ -99,7 +105,8 @@ def keys(tmp_path, monkeypatch):
     keys_dir = tmp_path / "keys"
     monkeypatch.setattr(identity, "KEYS_DIR", keys_dir)
     monkeypatch.setattr(identity, "REGISTRY", keys_dir / "public_keys.json")
-    monkeypatch.setattr(accounts, "ACCOUNTS_FILE", tmp_path / "memory_store" / "accounts.json")
+    db.close()
+    monkeypatch.setattr(db, "DB_FILE", tmp_path / "memory_store" / "memoria.db")
     for agent in AGENTS:
         identity.register_agent(agent)
     return keys_dir
@@ -110,11 +117,7 @@ def store(tmp_path, monkeypatch, keys):
     """A temporary memory store and a fake Cognee. Returns the fake Cognee."""
     folder = tmp_path / "memory_store"
     monkeypatch.setattr(memoria, "STORE", folder)
-    monkeypatch.setattr(memoria, "INDEX_FILE", folder / "memories.json")
-    monkeypatch.setattr(memoria, "AGENTS_FILE", folder / "agents.json")
     monkeypatch.setattr(memoria, "ACTIVITY_FILE", folder / "activity.log")
-    monkeypatch.setattr(memoria, "FORGET_FILE", folder / "pending_forget.json")
-    monkeypatch.setattr(memoria, "USAGE_FILE", folder / "usage.json")
     fake = FakeCognee()
     monkeypatch.setattr(memoria, "cognee", fake)
     # Fresh locks and worker for each test (each test runs its own event loop).
@@ -164,6 +167,29 @@ def memoria_url(store):
     yield f"http://127.0.0.1:{port}/mcp"
     web.should_exit = True
     thread.join(timeout=10)
+
+
+# ---------- looking inside Memoria's database ----------
+
+def index() -> dict:
+    """Every stored memory, by ID, as Memoria keeps it."""
+    return {mem["id"]: mem for mem in db.all_memories()}
+
+
+def save_index(data: dict) -> None:
+    """Store these memories exactly as given (for tests that tamper with the data)."""
+    for mem in data.values():
+        db.put_memory(mem)
+
+
+def pending_forget() -> list:
+    return db.forget_queue()
+
+
+def everything_stored() -> str:
+    """All of Memoria's database as text, to check what is (and isn't) kept."""
+    tables = [row[0] for row in db.query("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return "\n".join(str(tuple(row)) for t in tables for row in db.query(f"SELECT * FROM {t}"))
 
 
 async def settle():

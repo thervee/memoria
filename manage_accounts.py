@@ -19,8 +19,8 @@
 Changes take effect straight away, even while Memoria is running.
 """
 import argparse
-import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,42 +29,27 @@ HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")  # MEMORIA_SECRET_KEY
 
 import accounts  # noqa: E402
+import db  # noqa: E402
 import identity  # noqa: E402
 
 
-def _usage() -> dict:
-    path = accounts.ACCOUNTS_FILE.parent / "usage.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-
-def _memory_counts() -> dict:
-    path = accounts.ACCOUNTS_FILE.parent / "memories.json"
-    counts = {}
-    if path.exists():
-        for mem in json.loads(path.read_text(encoding="utf-8")).values():
-            account = mem.get("account", accounts.LOCAL)
-            counts[account] = counts.get(account, 0) + 1
-    return counts
-
-
 def show_list() -> None:
-    data = accounts.load()
-    if not data["accounts"]:
+    every = accounts.list_accounts()
+    if not every:
         print("No developer accounts yet. Make one with: manage_accounts.py create <account>")
         return
-    usage, counts = _usage(), _memory_counts()
-    for account, info in sorted(data["accounts"].items()):
-        limit = accounts.limits(account)
-        today = usage.get(account, {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    for info in every:
+        account, limit = info["id"], accounts.limits(info["id"])
         print(f"{account}  [{info['status']}]  {info.get('name') or ''} {info.get('email') or ''}")
-        print(f"    memories: {counts.get(account, 0)} of {limit['max_memories']}   "
-              f"writes today: {today.get('writes', 0)} of {limit['writes_per_day']}   "
+        print(f"    memories: {db.count_memories(account)} of {limit['max_memories']}   "
+              f"writes today: {db.writes_today(account, today)} of {limit['writes_per_day']}   "
               f"requests/minute: {limit['requests_per_minute']}")
         for key in accounts.keys_of(account):
             state = f"revoked {key['revoked_at']}" if key["revoked_at"] else "active"
             print(f"    key {key['key_id']}  agent '{key['agent']}'  {state}")
-    unused = sum(1 for i in data["invites"].values() if not i["used_by"])
-    print(f"\nUnused invite codes: {unused}.  Sign-up mode: {accounts.signup_mode()}")
+    print(f"\nUnused invite codes: {accounts.unused_invites()}.  "
+          f"Sign-up mode: {accounts.signup_mode()}")
 
 
 def main(argv=None) -> None:

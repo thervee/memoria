@@ -1,17 +1,13 @@
-"""The background worker that keeps Cognee in step with memories.json."""
+"""The background worker that keeps Cognee in step with Memoria's database."""
 import asyncio
 import json
 
 import memoria as m
-from conftest import settle
+from conftest import index, pending_forget, save_index, settle
 
 
 def run(coro):
     return asyncio.run(coro)
-
-
-def index():
-    return json.loads(m.INDEX_FILE.read_text(encoding="utf-8"))
 
 
 def errors():
@@ -19,10 +15,6 @@ def errors():
         return []
     return [json.loads(line) for line in m.ACTIVITY_FILE.read_text().splitlines()
             if json.loads(line)["action"].startswith("background")]
-
-
-def pending_forget():
-    return json.loads(m.FORGET_FILE.read_text()) if m.FORGET_FILE.exists() else []
 
 
 def test_save_answers_before_cognee_is_touched(store):
@@ -183,9 +175,25 @@ def test_old_memories_without_bookkeeping_fields_still_work(store):
         data = index()
         for field in ("needs_sync", "sync_version", "processed", "added_version"):
             data[mem["memory_id"]].pop(field)
-        m._write_json(m.INDEX_FILE, data)
+        save_index(data)
         assert m.all_memories()[0]["processing"] is False
         await m.update_memory("alice", mem["memory_id"], "Old style, updated.", "r")
         await settle()
         assert store.count("update") == 1 and index()[mem["memory_id"]]["needs_sync"] is False
+    run(scenario())
+
+
+def test_change_made_while_the_worker_is_busy_is_not_lost(store):
+    """If a memory changes while Cognee is still taking the old version, the new one follows."""
+    async def scenario():
+        mem = await m.save_memory("alice", "Version one.", "r", "test/x")
+
+        async def edit_meanwhile():
+            await m.update_memory("alice", mem["memory_id"], "Version two.", "changed")
+        store.during_add = edit_meanwhile
+        await settle()
+        texts = [doc["text"] for doc in store.docs.values()]
+        assert len(texts) == 1 and "Version two." in texts[0]
+        assert store.count("add") == 1 and store.count("update") == 1
+        assert index()[mem["memory_id"]]["needs_sync"] is False
     run(scenario())

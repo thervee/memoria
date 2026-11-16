@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 
 import backup
+import db
 
 HERE = Path(__file__).resolve().parent
 STORE = HERE / "memory_store"
@@ -50,6 +51,7 @@ def check_backup(path: Path) -> dict:
 def restore(path: Path, store: Path = STORE, now: datetime | None = None) -> Path:
     """Put the backup in place of the store. Returns where the old store was kept."""
     check_backup(path)
+    db.close()  # this program's own connection, if any (Windows can't move an open file)
     now = now or datetime.now()
     # Short folder names on purpose: Cognee's database paths are long, and Windows
     # refuses paths over 260 characters.

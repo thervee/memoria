@@ -4,9 +4,11 @@ While Memoria runs it makes a backup when it starts (if the newest one is more t
 a day old) and then once a day. Each backup is one zip file, named by date and time,
 e.g. memoria-backup-2026-11-16_1030.zip. The newest 14 are kept; older ones are deleted.
 
-What's in a backup: everything in memory_store (the memories, their history and
-signatures, the agent list, the activity log and Cognee's databases), except things
-that can be re-created: the downloaded search model, logs and lock files.
+What's in a backup: everything in memory_store (Memoria's database with the
+memories, their history and signatures, the agents and developer accounts; the
+activity log; and Cognee's databases), except things that can be re-created: the
+downloaded search model, logs and lock files. Memoria's database is copied with
+SQLite's own backup feature, so the copy is consistent even while it's in use.
 
 Settings (optional, in .env):
   MEMORIA_BACKUP_DIR   where backups go (default: the "backups" folder next to this file).
@@ -18,6 +20,7 @@ To restore one, stop Memoria and double-click restore_backup.bat.
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -30,6 +33,10 @@ EVERY = timedelta(days=1)
 SKIP_TOP = {"models", "server.log", "server.old.log", "watchdog.lock", "watchdog.pid"}
 SKIP_PARTS = {"pipeline_run_locks", "__pycache__"}
 SKIP_SUFFIXES = {".tmp", ".partial"}
+# Memoria's database is copied with SQLite's own backup feature instead of as plain
+# files, so the copy is complete and consistent even while Memoria is using it.
+DB_NAME = "memoria.db"
+DB_FILES = {DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm", DB_NAME + "-journal"}
 
 
 class BackupError(RuntimeError):
@@ -48,7 +55,7 @@ def keep_count() -> int:
 
 
 def _included(relative: Path) -> bool:
-    if relative.parts[0] in SKIP_TOP or SKIP_PARTS & set(relative.parts):
+    if relative.parts[0] in SKIP_TOP | DB_FILES or SKIP_PARTS & set(relative.parts):
         return False
     return relative.suffix not in SKIP_SUFFIXES
 
@@ -91,17 +98,21 @@ def make_backup(store: Path, folder: Path | None = None, now: datetime | None = 
 
     files = sorted(p for p in store.rglob("*")
                    if p.is_file() and _included(p.relative_to(store)))
-    index_file = store / "memories.json"
-    memories = json.loads(index_file.read_text(encoding="utf-8")) if index_file.exists() else {}
-    manifest = {
-        "made_at": now.isoformat(timespec="seconds"),
-        "memories": len(memories),
-        "files": len(files),
-        "made_from": str(store),
-    }
+    snapshot = folder / f".{final.stem}.db.partial"
     try:
+        memories = 0
+        if (store / DB_NAME).exists():
+            memories = _snapshot(store / DB_NAME, snapshot)
+        manifest = {
+            "made_at": now.isoformat(timespec="seconds"),
+            "memories": memories,
+            "files": len(files) + snapshot.exists(),
+            "made_from": str(store),
+        }
         with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             zf.writestr("backup_info.json", json.dumps(manifest, indent=2))
+            if snapshot.exists():
+                zf.write(snapshot, Path("memory_store") / DB_NAME)
             for path in files:
                 zf.write(path, Path("memory_store") / path.relative_to(store))
         with zipfile.ZipFile(partial) as zf:  # read it back to be sure it's sound
@@ -110,7 +121,20 @@ def make_backup(store: Path, folder: Path | None = None, now: datetime | None = 
         partial.replace(final)
     finally:
         partial.unlink(missing_ok=True)
+        snapshot.unlink(missing_ok=True)
     return final
+
+
+def _snapshot(database: Path, copy: Path) -> int:
+    """Copy the database with SQLite's backup feature. Returns how many memories it holds."""
+    source, target = sqlite3.connect(database), sqlite3.connect(copy)
+    try:
+        source.backup(target)
+        has_table = target.execute("SELECT 1 FROM sqlite_master WHERE name = 'memories'").fetchone()
+        return target.execute("SELECT count(*) FROM memories").fetchone()[0] if has_table else 0
+    finally:
+        source.close()
+        target.close()
 
 
 def prune(folder: Path | None = None, keep: int | None = None) -> list[Path]:
