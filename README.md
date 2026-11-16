@@ -59,12 +59,22 @@ Ed25519 keys:
   folder can only be opened by your Windows account, and it's never uploaded to GitHub.
 - a **public key** in `keys/public_keys.json`. It's safe to share and lets anyone check that agent's signatures.
 
-**Register a new agent:** double-click `register_agent.bat` and type its ID.
+**Connect a new agent:** double-click `connect_agent.bat` and type its ID. It registers the agent
+(if it isn't already) and prints the setup to copy, for three kinds of agent:
+1. **Claude Code:** one `claude mcp add ...` command to paste into PowerShell.
+2. **Any other MCP app** (Claude Desktop, Cursor, VS Code, ...): a few lines for the app's MCP settings.
+   The app runs `memoria_bridge.py`, which passes everything on to Memoria as that agent.
+3. **Your own Python agent:** a short example using `memoria_client.py`
+   (`async with Memoria("trader") as mem: await mem.find(...)`).
+
+In all three, login passes are made and renewed automatically: nothing to copy every hour.
+(`register_agent.bat` still works if you only want to create an agent's keys.)
 Registered so far: `claude-code`, `researcher`, `trader`, `outsider`.
 
 **Agents must prove who they are.** Every request needs `Authorization: Bearer <login pass>`, where
 the pass is made with the agent's secret key and is valid for 1 hour. `make_token.py <agent-id>` prints
-one. Claude Code runs it automatically when it connects. Requests without a valid pass get "401" and
+one. Claude Code runs it automatically when it connects, and the bridge and Python helper make their
+own. Requests without a valid pass get "401" and
 are refused, and an agent can't claim another agent's ID.
 
 ## Sharing
@@ -103,6 +113,9 @@ protect against someone who already controls Memoria and your Windows account on
 | `identity.py` | Agent keys, login passes and signatures |
 | `register_agent.bat` / `register_agent.py` | Register a new agent (creates its keys) |
 | `make_token.py` | Makes a login pass for an agent (Claude Code runs it automatically) |
+| `connect_agent.bat` / `connect_agent.py` | Connect a new agent: registers it and prints the setup to paste |
+| `memoria_bridge.py` | Lets any MCP app use Memoria as a command, with login passes handled for it |
+| `memoria_client.py` | Use Memoria from your own Python agents, with login passes handled for you |
 | `dashboard.py` | The dashboard's server side (list, history, sharing, delete, and its safety checks) |
 | `dashboard/` | The dashboard webpage (`index.html`, `app.css`, `app.js`) |
 | `keys/` | **Agents' secret keys** and the public key list. Never shared or uploaded. |
@@ -117,8 +130,8 @@ protect against someone who already controls Memoria and your Windows account on
 | `memory_store/pending_forget.json` | Deleted memories still waiting to be removed from Cognee's databases |
 
 ## Tests
-69 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
-who may delete, the background worker (including retries after failures), and the dashboard's
+78 automatic tests check the rules that matter most: login passes, signatures, privacy and sharing,
+who may delete, connecting agents (the bridge and Python helper), the background worker (including retries after failures), and the dashboard's
 safety checks. They take a few seconds, use a pretend Cognee (so no Gemini calls), and each one runs
 in its own temporary folder, so they never touch your real memories or keys.
 
@@ -133,5 +146,7 @@ Run them (in PowerShell, in the Memoria folder):
 ## Useful commands (type in PowerShell)
 - Check the connection: `claude mcp get memoria`
 - Disconnect from Claude Code: `claude mcp remove memoria -s user`
-- Connect another agent: register it, then have it connect to `http://127.0.0.1:8765/mcp` with the
-  header printed by `.venv\Scripts\python.exe make_token.py <its-id>` (make a new one at least every hour)
+- Connect another agent: `.venv\Scripts\python.exe connect_agent.py <its-id>` (or double-click
+  `connect_agent.bat`) and paste the setup it prints.
+- For an app that can only send a fixed header: connect it to `http://127.0.0.1:8765/mcp` with the header
+  printed by `.venv\Scripts\python.exe make_token.py <its-id>` (make a new one at least every hour)
