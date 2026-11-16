@@ -26,6 +26,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import paths
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import serialization
@@ -34,7 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-KEYS_DIR = Path(__file__).resolve().parent / "keys"
+KEYS_DIR = paths.KEYS
 REGISTRY = KEYS_DIR / "public_keys.json"
 AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 TOKEN_LIFETIME = 3600  # a login pass is valid for 1 hour

@@ -15,6 +15,8 @@ import os
 import time
 from collections import deque
 
+import paths
+
 
 def _setting(name: str, default: int) -> int:
     try:
@@ -76,7 +78,11 @@ MAX_REQUEST_BYTES = _setting("MEMORIA_MAX_REQUEST_BYTES", 64_000)
 
 
 def _trust_proxy() -> bool:
-    return os.environ.get("MEMORIA_TRUST_PROXY", "").strip().lower() in ("1", "true", "yes")
+    """On unless told otherwise when online (Railway always sits behind a proxy)."""
+    setting = os.environ.get("MEMORIA_TRUST_PROXY", "").strip().lower()
+    if setting:
+        return setting in ("1", "true", "yes", "on")
+    return paths.ONLINE
 
 
 def client_ip(scope) -> str:

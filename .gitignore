@@ -18,6 +18,12 @@ memory_store.*/
 # Backups of your memories (private, like memory_store)
 backups/
 
+# A data folder (MEMORIA_DATA_DIR) and database files, wherever they are
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # The Python workspace (re-created with: pip install -r requirements.txt)
 .venv/
 

@@ -18,10 +18,11 @@ from dotenv import load_dotenv
 
 import backup
 import db
+import paths
 
 HERE = Path(__file__).resolve().parent
-STORE = HERE / "memory_store"
-PORT = 8765
+STORE = paths.STORE
+PORT = paths.PORT
 
 
 def memoria_running() -> bool:

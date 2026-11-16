@@ -42,9 +42,11 @@ import dashboard  # noqa: E402
 import identity  # noqa: E402
 import limits  # noqa: E402
 import memoria  # noqa: E402
+import paths  # noqa: E402
 import signup  # noqa: E402
 
-HOST, PORT = "127.0.0.1", 8765
+# 127.0.0.1:8765 on this laptop; 0.0.0.0 and the host's PORT when online (see paths.py).
+HOST, PORT = paths.HOST, paths.PORT
 # Set ONLY by the login check below, never trusted from what a request sends.
 AGENT_HEADER = "x-memoria-agent"
 ACCOUNT_HEADER = "x-memoria-account"
@@ -268,7 +270,20 @@ def _already_running() -> bool:
     import socket
     with socket.socket() as s:
         s.settimeout(1)
-        return s.connect_ex((HOST, PORT)) == 0
+        return s.connect_ex(("127.0.0.1" if HOST == "0.0.0.0" else HOST, PORT)) == 0
+
+
+async def health(scope, receive, send) -> None:
+    """GET /health: is Memoria up and can it reach its database? (Railway checks this.)"""
+    try:
+        import db
+        db.query("SELECT 1")
+        status, body = 200, {"status": "ok"}
+    except Exception:
+        status, body = 503, {"status": "database unavailable"}
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": json.dumps(body).encode()})
 
 
 def build_app():
@@ -285,6 +300,8 @@ def build_app():
                     backup.start()  # daily backups of memory_store
                 return message
             return await agents_app(scope, receive_and_resume, send)
+        if scope["type"] == "http" and scope["path"] == "/health":
+            return await health(scope, receive, send)
         if scope["type"] == "http" and dashboard.handles(scope["path"]):
             return await dashboard.app(scope, receive, send)
         if scope["type"] == "http" and signup.handles(scope["path"]):
@@ -295,11 +312,21 @@ def build_app():
 
 
 if __name__ == "__main__":
+    problems = paths.online_problems()
+    if problems:  # online, refuse to start rather than run half set up
+        print("Memoria can't start online yet:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        sys.exit(1)
     if _already_running():
         print("Memoria is already running. Nothing to do.", file=sys.stderr)
         sys.exit(0)
-    print(f"Memoria is running at http://{HOST}:{PORT}/mcp  (close this window to stop it)",
-          file=sys.stderr)
+    if paths.ONLINE:
+        print(f"Memoria is running online on port {PORT} (data in {paths.DATA_DIR}).",
+              file=sys.stderr)
+    else:
+        print(f"Memoria is running at http://{HOST}:{PORT}/mcp  (close this window to stop it)",
+              file=sys.stderr)
     import uvicorn
 
     uvicorn.run(build_app(), host=HOST, port=PORT, log_level="warning")
