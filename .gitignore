@@ -1,0 +1,19 @@
+# Files Git must never upload.
+
+# Secrets: your API key lives here
+.env
+.env.*
+!.env.example
+
+# Your memories, databases, downloaded models, logs and lock files
+memory_store/
+
+# The Python workspace (re-created with: pip install -r requirements.txt)
+.venv/
+
+# Log files anywhere
+*.log
+
+# Python's temporary files
+__pycache__/
+*.pyc
