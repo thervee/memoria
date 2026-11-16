@@ -11,6 +11,10 @@ keys/
 *.pem
 dashboard_password*.json
 
+# API keys saved in text files for testing
+test_key.txt
+*_key.txt
+
 # Your memories, databases, downloaded models, logs and lock files
 memory_store/
 memory_store.*/
