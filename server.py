@@ -39,6 +39,7 @@ from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 import accounts  # noqa: E402
 import backup  # noqa: E402
 import dashboard  # noqa: E402
+import demo  # noqa: E402
 import identity  # noqa: E402
 import limits  # noqa: E402
 import memoria  # noqa: E402
@@ -173,6 +174,14 @@ def _agent(ctx: Context) -> tuple[str, str]:
     return agent_id, account
 
 
+def _writer(ctx: Context) -> tuple[str, str]:
+    """Like _agent, but refuses the public demo key, which may only use find_memory."""
+    agent_id, account = _agent(ctx)
+    if demo.is_read_only(account):
+        raise ToolError("The demo key is read-only: it can only use find_memory.")
+    return agent_id, account
+
+
 async def _run(action):
     """Run a memory action; show the agent a clear message if its request was wrong."""
     try:
@@ -195,7 +204,7 @@ async def save_memory(note: str, reason: str, topic: str, ctx: Context,
         visibility: "private" (only you can read it) or "shared" (you plus shared_with).
         shared_with: For shared memories: the agent IDs allowed to read it, e.g. ["trader"].
     """
-    agent_id, account = _agent(ctx)
+    agent_id, account = _writer(ctx)
     return await _run(memoria.save_memory(agent_id, note, reason, topic, confidence,
                                           visibility, shared_with, account=account))
 
@@ -232,7 +241,7 @@ async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context
         confidence: Optional new confidence: "low", "medium" or "high".
         topic: Optional new topic label.
     """
-    agent_id, account = _agent(ctx)
+    agent_id, account = _writer(ctx)
     return await _run(memoria.update_memory(agent_id, memory_id, new_note, reason,
                                             confidence, topic, account=account))
 
@@ -247,7 +256,7 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
         visibility: "private" (only the writer) or "shared" (the writer plus shared_with).
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
     """
-    agent_id, account = _agent(ctx)
+    agent_id, account = _writer(ctx)
     return await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
                                            account=account))
 
@@ -262,7 +271,7 @@ async def delete_memory(memory_id: str, ctx: Context) -> dict:
     Args:
         memory_id: The memory's ID (like "mem-1a2b3c4d"), from find_memory or save_memory.
     """
-    agent_id, account = _agent(ctx)
+    agent_id, account = _writer(ctx)
     return await _run(memoria.delete_memory(agent_id, memory_id, account=account))
 
 
@@ -296,6 +305,11 @@ def build_app():
             async def receive_and_resume():
                 message = await receive()
                 if message["type"] == "lifespan.startup":
+                    if paths.ONLINE:  # the public read-only demo key (see demo.py)
+                        try:
+                            await demo.ensure()
+                        except Exception as e:
+                            print(f"Memoria demo key not set up: {e}", file=sys.stderr)
                     memoria.start_background_work()
                     backup.start()  # daily backups of memory_store
                 return message
