@@ -72,7 +72,7 @@ per_ip = Window(_setting("MEMORIA_IP_LIMIT", 120), 60)              # requests p
 failed_logins = Window(_setting("MEMORIA_FAILED_LOGIN_LIMIT", 10), 600)  # per 10 minutes
 per_agent = Window(60, 60)  # the real limit comes from each account (requests_per_minute)
 per_account = Window(120, 60)  # likewise (account_requests_per_minute)
-signups_per_ip = Window(_setting("MEMORIA_SIGNUPS_PER_IP", 3), 3600)     # per hour
+signups_per_ip = Window(_setting("MEMORIA_SIGNUPS_PER_IP", 3), 86400)    # per day
 signups_total = Window(_setting("MEMORIA_SIGNUPS_PER_DAY", 50), 86400)   # per day, everyone
 MAX_REQUEST_BYTES = _setting("MEMORIA_MAX_REQUEST_BYTES", 64_000)
 

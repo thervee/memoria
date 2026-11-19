@@ -1,6 +1,8 @@
 """Hosting online: each developer's memories kept apart, and spam protection."""
 import asyncio
 import json
+import os
+import re
 
 import pytest
 from starlette.testclient import TestClient
@@ -14,7 +16,7 @@ import memoria_bridge
 import server
 import signup
 import db
-from conftest import index, save_index, settle
+from conftest import everything_stored, index, save_index, settle
 from memoria_client import Memoria
 from mcp import types
 
@@ -299,14 +301,40 @@ def test_forwarded_header_is_ignored_without_a_proxy(devs):
 
 @pytest.fixture
 def signups(keys, monkeypatch):
+    """Sign-up with a fake Turnstile (token "human" passes) and a fake mailbox."""
+    monkeypatch.setenv("TURNSTILE_SECRET_KEY", "test-turnstile-secret")
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    sent = []
+
+    async def turnstile(token, ip):
+        return token == "human"
+
+    async def send_email(to, subject, text, html):
+        if to.startswith("bounce@"):
+            raise RuntimeError("pretend the email service is down")
+        sent.append({"to": to, "subject": subject, "text": text, "html": html})
+    monkeypatch.setattr(signup, "check_turnstile", turnstile)
+    monkeypatch.setattr(signup, "send_email", send_email)
+
     def client(mode, ip="203.0.113.50"):
         monkeypatch.setenv("MEMORIA_SIGNUP", mode)
-        return TestClient(signup.app, base_url="https://memoria.example", client=(ip, 5000))
+        c = TestClient(signup.app, base_url="https://memoria.example", client=(ip, 5000))
+        c.sent = sent
+        return c
     return client
 
 
 def ask(client, **data):
-    return client.post("/signup", json={"email": "dev@new.example", **data})
+    return client.post("/signup", json={"email": "dev@new.example", "turnstile": "human",
+                                        **data})
+
+
+def link_token(client) -> str:
+    return re.search(r"verify\.html\?token=([\w-]+)", client.sent[-1]["text"]).group(1)
+
+
+def verify(client, token):
+    return client.post("/signup/verify", json={"token": token})
 
 
 def test_signup_is_off_unless_turned_on(signups):
@@ -314,11 +342,64 @@ def test_signup_is_off_unless_turned_on(signups):
     assert r.status_code == 404 and accounts.get_account("newco") is None
 
 
-def test_open_signup_gives_a_working_key(signups):
-    r = ask(signups("open"), account="newco", agent="bot")
-    assert r.status_code == 201
-    assert accounts.check_key(r.json()["api_key"]) == ("newco", "bot")
+def test_signup_emails_a_link_and_the_key_comes_only_after_it_is_clicked(signups):
+    client = signups("open")
+    r = ask(client, account="newco")
+    assert r.status_code == 202 and "api_key" not in r.json()
+    assert accounts.get_account("newco") is None  # nothing made before the link is clicked
+    email = client.sent[-1]
+    assert email["to"] == "dev@new.example" and "newco" in email["text"]
+    assert "https://www.memoriaagent.site/verify.html?token=" in email["text"]
+    token = link_token(client)
+    assert token not in everything_stored()  # only a hash of the link's secret is kept
+
+    done = verify(client, token)
+    assert done.status_code == 201
+    assert accounts.check_key(done.json()["api_key"]) == ("newco", "main")
     assert accounts.get_account("newco")["email"] == "dev@new.example"
+    assert accounts.limits("newco") == accounts.DEFAULT_LIMITS  # the normal limits
+
+    again = verify(client, token)  # the key is shown only once
+    assert again.status_code == 400 and "already been used" in again.json()["message"]
+    assert "api_key" not in again.json()
+
+
+def test_new_key_can_save_find_and_share(signups):
+    client = signups("open")
+    ask(client, account="newco")
+    account, agent = accounts.check_key(verify(client, link_token(client)).json()["api_key"])
+
+    async def use_it():
+        saved = await m.save_memory(agent, "Renewal is March 1.", "email", "acme",
+                                          account=account)
+        await m.share_memory(agent, saved["memory_id"], "shared", ["other"],
+                                   account=account)
+        return await m.find_memory(agent, "renewal", topic="acme", account=account)
+    assert [m["note"] for m in asyncio.run(use_it())] == ["Renewal is March 1."]
+
+
+def test_bad_or_expired_links_are_refused(signups, monkeypatch):
+    client = signups("open")
+    assert "isn't valid" in verify(client, "made-up").json()["message"]
+    ask(client, account="newco")
+    token = link_token(client)
+    monkeypatch.setattr(accounts, "_now", lambda: "2999-01-01T00:00:00+00:00")
+    r = verify(client, token)
+    assert r.status_code == 400 and "expired" in r.json()["message"]
+
+
+def test_signup_needs_the_human_check(signups):
+    r = ask(signups("open"), account="newco", turnstile="bot")
+    assert r.status_code == 400 and "human" in r.json()["message"]
+    r = ask(signups("open", ip="203.0.113.52"), account="newco", turnstile="")
+    assert r.status_code == 400
+    assert signups("open").sent == [] and accounts.get_account("newco") is None
+
+
+def test_signup_refuses_to_run_without_its_settings(signups, monkeypatch):
+    monkeypatch.delenv("TURNSTILE_SECRET_KEY")
+    r = ask(signups("open"), account="newco")
+    assert r.status_code == 503 and "isn't set up" in r.json()["message"]
 
 
 @pytest.mark.parametrize("data, error", [
@@ -331,47 +412,83 @@ def test_signup_checks_what_it_is_given(signups, data, error):
     assert r.status_code == 400 and error in r.json()["message"]
 
 
-def test_signup_refuses_taken_names(signups):
+def test_signup_refuses_taken_names_even_while_waiting(signups):
     client = signups("open")
     ask(client, account="newco")
-    r = ask(client, account="newco")
-    assert r.status_code == 400 and "already" in r.json()["message"]
+    r = ask(signups("open", ip="203.0.113.53"), account="newco", email="other@new.example")
+    assert r.status_code == 400 and "already taken" in r.json()["message"]
+
+
+def test_one_account_per_email(signups):
+    client = signups("open")
+    ask(client, account="newco")
+    r = ask(client, account="second", email="DEV@new.example")
+    assert r.status_code == 400 and "already has an account" in r.json()["message"]
+    verify(client, link_token(client))
+    r = ask(signups("open", ip="203.0.113.54"), account="third")
+    assert r.status_code == 400 and "already has an account" in r.json()["message"]
+
+
+def test_failed_email_frees_the_name_and_uses_no_quota(signups):
+    client = signups("open")
+    r = ask(client, account="newco", email="bounce@new.example")
+    assert r.status_code == 503 and "couldn't send" in r.json()["message"]
+    assert [ask(client, account="newco", email=f"d{i}@new.example").status_code
+            for i in range(3)][0] == 202
 
 
 def test_invite_signup_needs_a_fresh_code(signups):
     client = signups("invite")
     assert ask(client, account="newco").status_code == 400
     code = accounts.create_invite()
-    assert ask(client, account="newco", invite=code).status_code == 201
-    r = signups("invite", ip="203.0.113.51")
-    again = ask(r, account="other", invite=code)
+    assert ask(client, account="newco", invite=code).status_code == 202
+    other = signups("invite", ip="203.0.113.51")
+    again = ask(other, account="other", email="o@new.example", invite=code)
     assert again.status_code == 400 and "already been used" in again.json()["message"]
-    assert accounts.get_account("other") is None
 
 
-def test_signups_from_one_address_are_limited(signups):
+def test_signups_from_one_address_are_limited_per_day(signups):
     client = signups("open")
-    results = [ask(client, account=f"co-{i}").status_code for i in range(4)]
-    assert results == [201, 201, 201, 429]
-    assert ask(signups("open", ip="203.0.113.60"), account="co-9").status_code == 201
+    results = [ask(client, account=f"co-{i}", email=f"d{i}@new.example").status_code
+               for i in range(4)]
+    assert results == [202, 202, 202, 429]
+    assert limits.signups_per_ip.seconds == 86400
+    assert ask(signups("open", ip="203.0.113.60"), account="co-9",
+               email="d9@new.example").status_code == 202
 
 
 def test_signups_per_day_are_limited_for_everyone(signups, monkeypatch):
     monkeypatch.setattr(limits.signups_total, "limit", 2)
-    statuses = [ask(signups("open", ip=f"203.0.113.{70 + i}"), account=f"co-{i}").status_code
-                for i in range(3)]
-    assert statuses == [201, 201, 429]
+    statuses = [ask(signups("open", ip=f"203.0.113.{70 + i}"), account=f"co-{i}",
+                    email=f"d{i}@new.example").status_code for i in range(3)]
+    assert statuses == [202, 202, 429]
 
 
-def test_signup_without_server_secret_fails_clearly(signups, monkeypatch):
+def test_link_without_server_secret_fails_clearly_and_can_be_used_later(signups, monkeypatch):
+    client = signups("open")
+    ask(client, account="newco")
+    token = link_token(client)
+    secret = os.environ["MEMORIA_SECRET_KEY"]
     monkeypatch.delenv("MEMORIA_SECRET_KEY")
-    r = ask(signups("open"), account="newco")
+    r = verify(client, token)
     assert r.status_code == 503 and "isn't set up" in r.json()["message"]
+    monkeypatch.setenv("MEMORIA_SECRET_KEY", secret)
+    assert verify(client, token).status_code == 201
+
+
+def test_only_the_website_may_call_signup_from_a_browser(signups):
+    client = signups("open")
+    site = {"Origin": "https://www.memoriaagent.site"}
+    pre = client.options("/signup", headers={**site, "Access-Control-Request-Method": "POST"})
+    assert pre.status_code == 204
+    assert pre.headers["access-control-allow-origin"] == "https://www.memoriaagent.site"
+    r = client.post("/signup", json={}, headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
 
 
 def test_signup_refuses_huge_or_broken_requests(signups):
     client = signups("open")
-    assert client.post("/signup", content=b"x" * 3000).status_code == 400
+    assert client.post("/signup", content=b"x" * 5000).status_code == 400
     assert client.post("/signup", content=b"[1]").status_code == 400
     assert client.get("/signup").status_code == 405
 
