@@ -14,6 +14,7 @@ What's in it:
   api_keys      their API keys (hashes only)
   invites       sign-up invite codes (hashes only)
   signups       sign-ups waiting for their email link to be clicked (link hashes only)
+  key_requests  requests for a new agent's API key, waiting for their email link (hashes only)
 
 The activity log stays a plain text file (activity.log), easy to read and search.
 
@@ -113,6 +114,15 @@ CREATE TABLE IF NOT EXISTS signups (
 );
 CREATE INDEX IF NOT EXISTS signups_by_account ON signups(account);
 CREATE INDEX IF NOT EXISTS signups_by_email ON signups(email);
+CREATE TABLE IF NOT EXISTS key_requests (
+    hash       TEXT PRIMARY KEY,               -- of the secret in the email link
+    account    TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS key_requests_by_account ON key_requests(account);
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",

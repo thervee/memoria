@@ -8,6 +8,13 @@
     POST /signup/verify   {"token": "<the secret from the link>"}
         Creates the account and one API key (agent "main") and returns the key.
         Each link works once, within 24 hours, so the key is shown only once.
+    POST /keys            {"account": "acme", "email": "dev@acme.example", "agent": "analyst",
+                           "turnstile": "<Cloudflare Turnstile token>"}
+        A key for a NEW agent in an existing account. If the account name and email
+        match an active account, emails its owner a link (or, if the agent name is
+        taken or the account is full, an explanation). The answer is the same either
+        way, so this can't be used to find out who has an account. The link opens
+        the same verify page, and /signup/verify then makes the new agent's key.
     GET /signup/config
         {"open": true, "turnstile_site_key": "..."} for the website's sign-up form.
         The site key is public (Turnstile's widget shows it to every visitor).
@@ -67,7 +74,7 @@ def _allowed_origins() -> set[str]:
 
 
 def handles(path: str) -> bool:
-    return path in ("/signup", "/signup/verify", "/signup/config")
+    return path in ("/signup", "/signup/verify", "/signup/config", "/keys")
 
 
 def _cors(scope) -> list:
@@ -178,6 +185,8 @@ async def app(scope, receive, send) -> None:
                                                "\"email\": \"you@example.com\"}."), cors)
     if scope["path"] == "/signup/verify":
         return await _verify(send, data, cors)
+    if scope["path"] == "/keys":
+        return await _start_key(scope, send, data, cors)
     return await _start(scope, send, data, mode, cors)
 
 
@@ -238,14 +247,108 @@ async def _start(scope, send, data: dict, mode: str, cors) -> None:
     }, cors)
 
 
-async def _verify(send, data: dict, cors) -> None:
+def _key_link_email(account: str, agent: str, link: str) -> tuple[str, str, str]:
+    hours = accounts.SIGNUP_LINK_HOURS
+    subject = f"Your key for the new agent '{agent}'"
+    text = (f"Someone, hopefully you, asked for an API key for a new agent called "
+            f"'{agent}' in your Memoria account '{account}'.\n\n"
+            f"Open this link to get the key:\n{link}\n\n"
+            f"The link works once and expires in {hours} hours. If you didn't ask for "
+            f"this, ignore this email: no key will be made.\n\nMemoria")
+    html = (f"<p>Someone, hopefully you, asked for an API key for a new agent called "
+            f"<strong>{agent}</strong> in your Memoria account <strong>{account}</strong>.</p>"
+            f'<p><a href="{link}">Get the key</a></p>'
+            f"<p>The link works once and expires in {hours} hours. If you didn't ask for "
+            f"this, ignore this email: no key will be made.</p><p>Memoria</p>")
+    return subject, text, html
+
+
+def _key_problem_email(account: str, agent: str, problem: str) -> tuple[str, str, str]:
+    subject = f"No key made for the agent '{agent}'"
+    text = (f"Someone, hopefully you, asked for an API key for a new agent called "
+            f"'{agent}' in your Memoria account '{account}'.\n\n{problem}\n\n"
+            f"If you didn't ask for this, you can ignore this email.\n\nMemoria")
+    html = (f"<p>Someone, hopefully you, asked for an API key for a new agent called "
+            f"<strong>{agent}</strong> in your Memoria account <strong>{account}</strong>."
+            f"</p><p>{problem}</p><p>If you didn't ask for this, you can ignore this "
+            f"email.</p><p>Memoria</p>")
+    return subject, text, html
+
+
+async def _start_key(scope, send, data: dict, cors) -> None:
+    if not _setting("TURNSTILE_SECRET_KEY") or not _setting("RESEND_API_KEY"):
+        return await _answer(send, 503, _error("This isn't set up on this server yet."), cors)
+    ip = limits.client_ip(scope)
+    wait = limits.key_requests_per_ip.blocked_for(ip)
+    if wait:
+        seconds = max(1, round(wait))
+        return await _answer(send, 429, _error(f"Too many requests. Try again in {seconds} "
+                                               "seconds."),
+                             [*cors, (b"retry-after", str(seconds).encode())])
+    account = str(data.get("account", "")).strip().lower()
+    email = str(data.get("email", "")).strip()
+    agent = str(data.get("agent", "")).strip().lower()
+    if not EMAIL.match(email):
+        return await _answer(send, 400, _error("Please give a valid email address."), cors)
+    if not identity.AGENT_ID_PATTERN.match(account):
+        return await _answer(send, 400, _error("Please give your account name."), cors)
     try:
-        account, agent, api_key = accounts.finish_signup(str(data.get("token", "")))
+        human = await check_turnstile(str(data.get("turnstile", "")).strip(), ip)
+    except Exception as e:
+        print(f"Memoria keys: Turnstile check failed: {e}", file=sys.stderr)
+        return await _answer(send, 503, _error("We couldn't check you're human just now. "
+                                               "Please try again in a minute."), cors)
+    if not human:
+        return await _answer(send, 400, _error("Please complete the \"I'm human\" check "
+                                               "and try again."), cors)
+    try:
+        found = accounts.start_key_request(account, email, agent)
+    except accounts.AccountError as e:  # e.g. the agent name isn't allowed
+        return await _answer(send, 400, _error(str(e)), cors)
+    limits.key_requests_per_ip.hit(ip)
+    done = {"message": f"If '{account}' is an account with the email {email}, we've sent it "
+                       f"an email. Open the link in it within {accounts.SIGNUP_LINK_HOURS} "
+                       "hours to get the new agent's API key."}
+    if found is None or limits.key_emails_per_account.blocked_for(account):
+        return await _answer(send, 202, done, cors)  # the same answer: reveal nothing
+    kind, value = found
+    if kind == "link":
+        message = _key_link_email(account, agent, f"{_site_url()}/verify.html?token={value}")
+    else:
+        message = _key_problem_email(account, agent, value)
+    try:
+        await send_email(email.lower(), *message)
+    except Exception as e:
+        if kind == "link":
+            accounts.cancel_key_request(value)
+        print(f"Memoria keys: email to account owner not sent: {e}", file=sys.stderr)
+        return await _answer(send, 503, _error("We couldn't send the email just now. "
+                                               "Please try again in a minute."), cors)
+    limits.key_emails_per_account.hit(account)
+    return await _answer(send, 202, done, cors)
+
+
+async def _verify(send, data: dict, cors) -> None:
+    token = str(data.get("token", ""))
+    if accounts.link_kind(token) == "agent":
+        try:
+            account, agent, api_key = accounts.finish_key_request(token)
+        except accounts.AccountError as e:
+            return await _answer(send, 400, _error(str(e)), cors)
+        except identity.IdentityError:
+            return await _answer(send, 503, _error("This isn't set up on this server yet."),
+                                 cors)
+        return await _answer(send, 201, {
+            "kind": "agent", "account": account, "agent": agent, "api_key": api_key,
+            "message": "Save this API key now: it is shown only once.",
+        }, cors)
+    try:
+        account, agent, api_key = accounts.finish_signup(token)
     except accounts.AccountError as e:
         return await _answer(send, 400, _error(str(e)), cors)
     except identity.IdentityError:
         return await _answer(send, 503, _error("Sign-up isn't set up on this server yet."), cors)
     return await _answer(send, 201, {
-        "account": account, "agent": agent, "api_key": api_key,
+        "kind": "signup", "account": account, "agent": agent, "api_key": api_key,
         "message": "Save this API key now: it is shown only once.",
     }, cors)
