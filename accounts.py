@@ -213,6 +213,85 @@ def unused_invites() -> int:
     return db.query("SELECT count(*) FROM invites WHERE used_by IS NULL")[0][0]
 
 
+# ---------- sign-ups waiting for their email link (see signup.py) ----------
+
+SIGNUP_LINK_HOURS = 24
+SIGNUP_AGENT = "main"  # the agent a new account's first API key belongs to
+
+
+def _later(hours: int) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc).replace(microsecond=0)
+            + timedelta(hours=hours)).isoformat()
+
+
+def start_signup(account: str, email: str, invite: str = "") -> str:
+    """Reserve an account name for an email address until its link is clicked.
+
+    Returns the secret for the email link. Nothing is created until finish_signup().
+    One account per email address, counting sign-ups still waiting for their link.
+    """
+    account = _check_name(account, "The account name")
+    if account == LOCAL:
+        raise AccountError("'local' is reserved for this laptop's own agents.")
+    email = (email or "").strip().lower()
+    now = _now()
+    with db.transaction() as conn:
+        waiting = "used_at IS NULL AND expires_at > ?"
+        if conn.execute("SELECT 1 FROM accounts WHERE id = ?", (account,)).fetchone() or \
+                conn.execute(f"SELECT 1 FROM signups WHERE account = ? AND {waiting}",
+                             (account, now)).fetchone():
+            raise AccountError(f"The name '{account}' is already taken. Please choose another.")
+        if conn.execute("SELECT 1 FROM accounts WHERE lower(email) = ?", (email,)).fetchone() or \
+                conn.execute(f"SELECT 1 FROM signups WHERE email = ? AND {waiting}",
+                             (email, now)).fetchone():
+            raise AccountError("This email address already has an account, or a sign-up "
+                               "waiting for its email link to be clicked.")
+        if signup_mode() == "invite":
+            check_invite(invite)
+            conn.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE hash = ?",
+                         (account, now, _hash(invite.strip())))
+        secret = secrets.token_urlsafe(32)
+        conn.execute("INSERT INTO signups (hash, account, email, created_at, expires_at) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (_hash(secret), account, email, now, _later(SIGNUP_LINK_HOURS)))
+    return secret
+
+
+def cancel_signup(secret: str) -> None:
+    """Forget a sign-up whose email couldn't be sent, so it can be tried again."""
+    db.execute("DELETE FROM signups WHERE hash = ? AND used_at IS NULL", (_hash(secret or ""),))
+
+
+def finish_signup(secret: str) -> tuple[str, str, str]:
+    """The email link was clicked: create the account and its API key, once.
+
+    Returns (account, agent, api_key). The key is shown only this once.
+    """
+    key_hash = _hash((secret or "").strip())
+    with db.transaction() as conn:
+        row = conn.execute("SELECT * FROM signups WHERE hash = ?", (key_hash,)).fetchone()
+        if row is None:
+            raise AccountError("This link isn't valid. Please check you copied all of it.")
+        if row["used_at"]:
+            raise AccountError("This link has already been used. The API key was shown only "
+                               "once, when it was first opened.")
+        if row["expires_at"] <= _now():
+            raise AccountError("This link has expired. Please sign up again.")
+        conn.execute("UPDATE signups SET used_at = ? WHERE hash = ?", (_now(), key_hash))
+    account = row["account"]
+    try:
+        create_account(account, email=row["email"])
+        api_key = create_key(account, SIGNUP_AGENT)
+    except BaseException:
+        # Undo, so the link can be used again once the problem is fixed.
+        db.execute("DELETE FROM accounts WHERE id = ? AND NOT EXISTS "
+                   "(SELECT 1 FROM api_keys WHERE account = ?)", (account, account))
+        db.execute("UPDATE signups SET used_at = NULL WHERE hash = ?", (key_hash,))
+        raise
+    return account, SIGNUP_AGENT, api_key
+
+
 def signup_mode() -> str:
     """'off' (the default), 'invite' (needs an invite code) or 'open' (anyone)."""
     mode = os.environ.get("MEMORIA_SIGNUP", "off").strip().lower()
