@@ -292,6 +292,94 @@ def finish_signup(secret: str) -> tuple[str, str, str]:
     return account, SIGNUP_AGENT, api_key
 
 
+# ---------- keys for more agents, by email link (see signup.py, POST /keys) ----------
+
+def start_key_request(account: str, email: str, agent: str) -> tuple[str, str] | None:
+    """A request for a NEW agent's API key in an existing account.
+
+    Returns None if no active account has this name and email (the caller answers the
+    same either way, so nobody learns who has an account). Otherwise returns
+    ("link", secret) for the email link, or ("problem", explanation) when the agent
+    name is taken or the account has all the agents it may have.
+    Keys are only ever made for new agents: a key for an existing agent would let
+    whoever asked act as that agent.
+    """
+    account = (account or "").strip().lower()
+    email = (email or "").strip().lower()
+    agent = _check_name(agent, "The agent name")
+    info = get_account(account)
+    if not info or info["status"] != "active" or not email \
+            or (info.get("email") or "").strip().lower() != email:
+        return None
+    now = _now()
+    with db.transaction() as conn:
+        taken = conn.execute("SELECT 1 FROM api_keys WHERE account = ? AND agent = ?",
+                             (account, agent)).fetchone() or conn.execute(
+            "SELECT 1 FROM key_requests WHERE account = ? AND agent = ? AND used_at IS NULL "
+            "AND expires_at > ?", (account, agent, now)).fetchone()
+        if taken:
+            return "problem", (f"Your account '{account}' already has an agent called "
+                               f"'{agent}', or a request for it waiting. Please choose a "
+                               "different name for the new agent.")
+        most = limits(account)["max_agents"]
+        agents = {row["agent"] for row in conn.execute(
+            "SELECT DISTINCT agent FROM api_keys WHERE account = ? AND revoked_at IS NULL",
+            (account,))}
+        if len(agents) >= most:
+            return "problem", (f"Your account '{account}' already has the most agents "
+                               f"allowed ({most}), so no key was made for '{agent}'.")
+        secret = secrets.token_urlsafe(32)
+        conn.execute("INSERT INTO key_requests (hash, account, agent, created_at, expires_at) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (_hash(secret), account, agent, now, _later(SIGNUP_LINK_HOURS)))
+    return "link", secret
+
+
+def cancel_key_request(secret: str) -> None:
+    db.execute("DELETE FROM key_requests WHERE hash = ? AND used_at IS NULL",
+               (_hash(secret or ""),))
+
+
+def link_kind(secret: str) -> str | None:
+    """Which kind of email link this is: "signup", "agent" or None (unknown)."""
+    key_hash = _hash((secret or "").strip())
+    if db.query("SELECT 1 FROM signups WHERE hash = ?", (key_hash,)):
+        return "signup"
+    if db.query("SELECT 1 FROM key_requests WHERE hash = ?", (key_hash,)):
+        return "agent"
+    return None
+
+
+def finish_key_request(secret: str) -> tuple[str, str, str]:
+    """The email link was clicked: make the new agent's API key, once.
+
+    Returns (account, agent, api_key). The key is shown only this once.
+    """
+    key_hash = _hash((secret or "").strip())
+    with db.transaction() as conn:
+        row = conn.execute("SELECT r.*, a.status FROM key_requests r JOIN accounts a "
+                           "ON a.id = r.account WHERE r.hash = ?", (key_hash,)).fetchone()
+        if row is None:
+            raise AccountError("This link isn't valid. Please check you copied all of it.")
+        if row["used_at"]:
+            raise AccountError("This link has already been used. The API key was shown only "
+                               "once, when it was first opened.")
+        if row["expires_at"] <= _now():
+            raise AccountError("This link has expired. Please ask for the key again.")
+        if row["status"] != "active":
+            raise AccountError("This account is disabled.")
+        if conn.execute("SELECT 1 FROM api_keys WHERE account = ? AND agent = ?",
+                        (row["account"], row["agent"])).fetchone():
+            raise AccountError(f"The agent '{row['agent']}' already has a key.")
+        conn.execute("UPDATE key_requests SET used_at = ? WHERE hash = ?", (_now(), key_hash))
+    try:
+        api_key = create_key(row["account"], row["agent"])
+    except BaseException:
+        db.execute("UPDATE key_requests SET used_at = NULL WHERE hash = ?", (key_hash,))
+        raise
+    return row["account"], row["agent"], api_key
+
+
 def signup_mode() -> str:
     """'off' (the default), 'invite' (needs an invite code) or 'open' (anyone)."""
     mode = os.environ.get("MEMORIA_SIGNUP", "off").strip().lower()

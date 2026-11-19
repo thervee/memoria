@@ -502,6 +502,85 @@ def test_signup_refuses_huge_or_broken_requests(signups):
     assert client.get("/signup").status_code == 405
 
 
+# ---------- keys for more agents (POST /keys) ----------
+
+@pytest.fixture
+def owner(signups):
+    """An account made through sign-up: newco, owned by dev@new.example, agent "main"."""
+    client = signups("open")
+    ask(client, account="newco")
+    verify(client, link_token(client))
+    client.sent.clear()
+    return client
+
+
+def want_key(client, **data):
+    return client.post("/keys", json={"account": "newco", "email": "dev@new.example",
+                                      "agent": "analyst", "turnstile": "human", **data})
+
+
+def test_owner_gets_a_key_for_a_new_agent_by_email_link(owner):
+    r = want_key(owner)
+    assert r.status_code == 202 and "api_key" not in r.json()
+    assert owner.sent[-1]["to"] == "dev@new.example" and "analyst" in owner.sent[-1]["text"]
+    token = link_token(owner)
+    assert token not in everything_stored()
+    done = verify(owner, token)
+    assert done.status_code == 201 and done.json()["kind"] == "agent"
+    assert accounts.check_key(done.json()["api_key"]) == ("newco", "analyst")
+    again = verify(owner, token)
+    assert again.status_code == 400 and "already been used" in again.json()["message"]
+
+
+def test_wrong_email_or_account_gets_the_same_answer_and_no_email(owner):
+    def shape(r, account, email):  # the answer, minus what the request itself said
+        return r.status_code, r.json()["message"].replace(account, "A").replace(email, "E")
+    right = shape(want_key(owner), "newco", "dev@new.example")
+    owner.sent.clear()
+    assert shape(want_key(owner, agent="other", email="someone@else.example"),
+                 "newco", "someone@else.example") == right
+    assert shape(want_key(owner, agent="other", account="nobody"),
+                 "nobody", "dev@new.example") == right
+    assert owner.sent == []
+
+
+def test_existing_agents_never_get_another_key(owner):
+    r = want_key(owner, agent="main")
+    assert r.status_code == 202  # the same answer...
+    assert "already has an agent called 'main'" in owner.sent[-1]["text"]  # ...but no link
+    assert "verify.html" not in owner.sent[-1]["text"]
+    assert len(accounts.keys_of("newco")) == 1
+
+
+def test_a_full_account_gets_an_explanation_not_a_link(owner):
+    accounts.set_limit("newco", "max_agents", 1)
+    want_key(owner)
+    assert "most agents allowed (1)" in owner.sent[-1]["text"]
+    assert "verify.html" not in owner.sent[-1]["text"]
+
+
+def test_key_requests_need_the_human_check(owner):
+    r = want_key(owner, turnstile="bot")
+    assert r.status_code == 400 and "human" in r.json()["message"] and owner.sent == []
+
+
+def test_key_requests_are_limited_per_address_and_per_account(owner, signups):
+    statuses = [want_key(owner, agent=f"bot-{i}").status_code for i in range(6)]
+    assert statuses == [202] * 5 + [429]
+    assert len(owner.sent) == 5
+    other = signups("open", ip="203.0.113.99")
+    assert want_key(other, agent="bot-9").status_code == 202
+    assert len(owner.sent) == 5  # the owner's inbox gets at most 5 a day
+
+
+def test_disabled_accounts_get_no_keys(owner):
+    want_key(owner)
+    token = link_token(owner)
+    accounts.set_status("newco", "disabled")
+    r = verify(owner, token)
+    assert r.status_code == 400 and "disabled" in r.json()["message"]
+
+
 # ---------- the dashboard must stay on the host computer ----------
 
 def test_dashboard_refuses_requests_through_a_proxy(store):
