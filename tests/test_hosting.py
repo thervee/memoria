@@ -486,6 +486,15 @@ def test_only_the_website_may_call_signup_from_a_browser(signups):
     assert "access-control-allow-origin" not in r.headers
 
 
+def test_config_gives_the_form_its_public_site_key(signups, monkeypatch):
+    monkeypatch.setenv("TURNSTILE_SITE_KEY", "public-site-key")
+    assert signups("open").get("/signup/config").json() == {
+        "open": True, "invite": False, "turnstile_site_key": "public-site-key"}
+    assert signups("off").get("/signup/config").json()["open"] is False
+    body = signups("open").get("/signup/config").text
+    assert "test-turnstile-secret" not in body and "test-resend-key" not in body
+
+
 def test_signup_refuses_huge_or_broken_requests(signups):
     client = signups("open")
     assert client.post("/signup", content=b"x" * 5000).status_code == 400

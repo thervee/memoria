@@ -8,6 +8,9 @@
     POST /signup/verify   {"token": "<the secret from the link>"}
         Creates the account and one API key (agent "main") and returns the key.
         Each link works once, within 24 hours, so the key is shown only once.
+    GET /signup/config
+        {"open": true, "turnstile_site_key": "..."} for the website's sign-up form.
+        The site key is public (Turnstile's widget shows it to every visitor).
 
 OFF unless the host turns it on:
   MEMORIA_SIGNUP=off      (default) nobody can sign up; the host creates accounts
@@ -17,6 +20,7 @@ OFF unless the host turns it on:
   MEMORIA_SIGNUP=open     anyone can sign up
 
 Sign-up also needs these settings (Railway variables), or it refuses to run:
+  TURNSTILE_SITE_KEY      Cloudflare Turnstile's site key (public; the form loads it)
   TURNSTILE_SECRET_KEY    Cloudflare Turnstile's secret key (the "are you human?" check)
   RESEND_API_KEY          Resend's API key, for sending the verification emails
   MEMORIA_EMAIL_FROM      optional, default "Memoria <noreply@memoriaagent.site>"
@@ -63,7 +67,7 @@ def _allowed_origins() -> set[str]:
 
 
 def handles(path: str) -> bool:
-    return path in ("/signup", "/signup/verify")
+    return path in ("/signup", "/signup/verify", "/signup/config")
 
 
 def _cors(scope) -> list:
@@ -155,6 +159,11 @@ async def app(scope, receive, send) -> None:
     if scope["method"] == "OPTIONS":  # the browser asking whether the website may call us
         return await send_preflight(send, cors)
     mode = accounts.signup_mode()
+    if scope["path"] == "/signup/config":
+        site_key = _setting("TURNSTILE_SITE_KEY")
+        return await _answer(send, 200, {"open": mode != "off" and bool(site_key),
+                                         "invite": mode == "invite",
+                                         "turnstile_site_key": site_key}, cors)
     if mode == "off":
         return await _answer(send, 404, _error("Sign-up is closed. Ask the host for an account."),
                              cors)
