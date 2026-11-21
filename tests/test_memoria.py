@@ -81,7 +81,7 @@ def test_private_memory_is_invisible_to_others(store):
     run(scenario())
 
 
-def test_shared_reader_can_find_and_update_but_not_share_or_delete(store):
+def test_shared_reader_can_find_but_not_update_share_or_delete(store):
     mem = save(visibility="shared", shared_with=["bob"])
     mid = mem["memory_id"]
 
@@ -89,8 +89,8 @@ def test_shared_reader_can_find_and_update_but_not_share_or_delete(store):
         await settle()
         assert [x["memory_id"] for x in await m.find_memory("bob", "penguins")] == [mid]
         assert await m.find_memory("carol", "penguins") == []
-        updated = await m.update_memory("bob", mid, "Penguins huddle and take turns.", "more detail")
-        assert updated["updated_by"] == "bob" and updated["verification"] == "verified"
+        with pytest.raises(m.MemoriaError, match="Only the agent that wrote"):
+            await m.update_memory("bob", mid, "Penguins huddle and take turns.", "more detail")
         with pytest.raises(m.MemoriaError, match="Only the agent that wrote"):
             await m.share_memory("bob", mid, "shared", ["carol"])
         with pytest.raises(m.MemoriaError, match="Only the agent that wrote"):
