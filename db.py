@@ -242,8 +242,18 @@ _INSERT_NEW = (f"INSERT OR IGNORE INTO memories ({', '.join(MEMORY_FIELDS)}) "
                f"VALUES ({', '.join('?' for _ in MEMORY_FIELDS)})")
 
 
+_INSERT_ONLY = (f"INSERT INTO memories ({', '.join(MEMORY_FIELDS)}) "
+                f"VALUES ({', '.join('?' for _ in MEMORY_FIELDS)}) ON CONFLICT(id) DO NOTHING")
+
+
+def add_memory(mem: dict) -> bool:
+    """Save a NEW memory. Never replaces one: returns False if a memory with this ID
+    already exists, in any account, and leaves that memory exactly as it was."""
+    return execute(_INSERT_ONLY, _to_row(mem)) == 1
+
+
 def put_memory(mem: dict) -> None:
-    """Save a memory (new or changed)."""
+    """Save changes to a memory that was looked up (and its owner checked) first."""
     execute(_UPSERT, _to_row(mem))
 
 

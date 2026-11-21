@@ -35,8 +35,8 @@ Nothing is lost if Memoria stops: the worker picks up unfinished work next start
 import asyncio
 import json
 import re
+import secrets
 import sys
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
@@ -189,6 +189,15 @@ def _as_text(mem: dict) -> str:
     return "\n".join(lines)
 
 
+SAVE_ATTEMPTS = 5
+
+
+def _new_memory_id() -> str:
+    """A new memory ID: "mem-" and 32 hex characters (128 random bits).
+    Memories saved before this have shorter IDs ("mem-" and 8), which still work."""
+    return "mem-" + secrets.token_hex(16)
+
+
 NO_SOURCE = "no source"
 MAX_SOURCE = 500
 
@@ -276,7 +285,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
     visibility, shared_with = _check_sharing(visibility, shared_with, agent_id)
     source = _check_source(source)
     mem = {
-        "id": "mem-" + uuid.uuid4().hex[:8],
+        "id": _new_memory_id(),
         "account": account,
         "agent_id": agent_id,
         "created_at": _now(),
@@ -293,7 +302,15 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
     _mark_changed(mem)  # the background worker adds it to Cognee
     async with _write_lock:
         _use_quota(account, new_memory=True)
-        db.put_memory(mem)
+        # Never replace an existing memory (of any account). An ID that is already
+        # taken just gets a new one; with 128 random bits that should never happen.
+        for _ in range(SAVE_ATTEMPTS):
+            if db.add_memory(mem):
+                break
+            mem["id"] = _new_memory_id()
+            _sign(mem, who)  # the ID is part of what's signed
+        else:
+            raise MemoriaError("Could not save the memory just now. Please try again.")
     _log(who, "save", memory_id=mem["id"], topic=mem["topic"])
     _kick()
     return _public(mem)
@@ -331,7 +348,7 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
         for chunk in chunks:
             mem = by_data_id.get(str(chunk.get("document_id")))
             if mem is None:  # fall back to the memory ID written in the text
-                match = re.search(r"Memoria memory (mem-[0-9a-f]{8})", chunk.get("text", ""))
+                match = re.search(r"Memoria memory (mem-[0-9a-f]{8,32})", chunk.get("text", ""))
                 mem = db.get_memory(match.group(1)) if match else None
             if mem and mem not in found and wanted(mem):
                 found.append(mem)
