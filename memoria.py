@@ -242,9 +242,16 @@ def _verification(mem: dict) -> dict:
     """Check the memory's signature right now."""
     expected = identity.principal(account_of(mem), mem.get("updated_by") or mem["agent_id"])
     ok, detail = identity.verify(_signed_content(mem), mem.get("signature"), expected)
+    by_author = ok and (mem.get("updated_by") or mem["agent_id"]) == mem["agent_id"]
+    if ok and not by_author:
+        # Only possible for memories changed by a shared reader before that was blocked:
+        # the signature is the editor's, so never present it as the author's.
+        detail += (f", who changed it; '{mem['agent_id']}' saved the original but did NOT "
+                   "sign this version")
     if ok:
         detail += ", including its source" if mem.get("source") else " (it has no source)"
-    return {"verification": "verified" if ok else "NOT verified", "verification_detail": detail}
+    return {"verification": "verified" if ok else "NOT verified", "verification_detail": detail,
+            "signed_by_author": by_author}
 
 
 def _public(mem: dict) -> dict:
@@ -403,6 +410,11 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
+        if mem["agent_id"] != agent_id:  # shared memories are read-only for their readers
+            raise MemoriaError(
+                f"Only the agent that wrote this memory ('{mem['agent_id']}') can update it. "
+                "Memories shared with you are read-only: save your own memory instead."
+            )
         _use_quota(account, new_memory=False)
 
         # Keep the old version in the history so nothing is lost.
