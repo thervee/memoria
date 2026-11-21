@@ -189,6 +189,22 @@ def _as_text(mem: dict) -> str:
     return "\n".join(lines)
 
 
+NO_SOURCE = "no source"
+MAX_SOURCE = 500
+
+
+def _check_source(source) -> str | None:
+    """An optional source: a URL, transaction hash, file name or short note. None if empty."""
+    if source is None:
+        return None
+    if not isinstance(source, str):
+        raise MemoriaError("source must be text, e.g. a URL, a transaction hash or a file name.")
+    source = " ".join(source.split())  # one line, no stray spaces
+    if len(source) > MAX_SOURCE:
+        raise MemoriaError(f"source can be {MAX_SOURCE} characters at most.")
+    return source or None
+
+
 SIGNED_FIELDS = ("id", "agent_id", "created_at", "topic", "confidence", "note", "reason",
                  "updated_at", "updated_by")
 
@@ -196,6 +212,8 @@ SIGNED_FIELDS = ("id", "agent_id", "created_at", "topic", "confidence", "note", 
 def _signed_content(mem: dict) -> bytes:
     """The exact bytes that get signed: the memory's content and authorship labels."""
     content = {field: mem.get(field) for field in SIGNED_FIELDS}
+    if mem.get("source"):  # (left out when there is none, so older signatures still match)
+        content["source"] = mem["source"]
     if account_of(mem) != LOCAL:  # (left out for "local", so older signatures still match)
         content["account"] = account_of(mem)
     return ("memoria-memory-v1|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
@@ -215,6 +233,8 @@ def _verification(mem: dict) -> dict:
     """Check the memory's signature right now."""
     expected = identity.principal(account_of(mem), mem.get("updated_by") or mem["agent_id"])
     ok, detail = identity.verify(_signed_content(mem), mem.get("signature"), expected)
+    if ok:
+        detail += ", including its source" if mem.get("source") else " (it has no source)"
     return {"verification": "verified" if ok else "NOT verified", "verification_detail": detail}
 
 
@@ -227,6 +247,9 @@ def _public(mem: dict) -> dict:
         "topic": mem["topic"],
         "note": mem["note"],
         "reason": mem["reason"],
+        # Where the claim came from, so readers can check it. "no source" means it can't be.
+        "source": mem.get("source") or NO_SOURCE,
+        "has_source": bool(mem.get("source")),
         "confidence": mem["confidence"],
         "saved_by": mem["agent_id"],
         "saved_at": mem["created_at"],
@@ -246,10 +269,12 @@ def _public(mem: dict) -> dict:
 
 async def save_memory(agent_id: str, note: str, reason: str, topic: str,
                       confidence: str = "medium", visibility: str = "private",
-                      shared_with: list[str] | None = None, account: str = LOCAL) -> dict:
+                      shared_with: list[str] | None = None, account: str = LOCAL,
+                      source: str | None = None) -> dict:
     agent_id = check_agent(agent_id, account)
     who = identity.principal(account, agent_id)
     visibility, shared_with = _check_sharing(visibility, shared_with, agent_id)
+    source = _check_source(source)
     mem = {
         "id": "mem-" + uuid.uuid4().hex[:8],
         "account": account,
@@ -259,6 +284,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
         "confidence": _check_confidence(confidence),
         "note": _require(note, "note"),
         "reason": _require(reason, "reason"),
+        "source": source,
         "history": [],
         "visibility": visibility,
         "shared_with": shared_with,

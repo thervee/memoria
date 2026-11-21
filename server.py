@@ -57,13 +57,15 @@ mcp = MCPServer(
     instructions=(
         "Memoria is your long-term memory. Before starting work, use find_memory to "
         "check what you (or other agents) already learned about the topic. Save useful "
-        "findings and decisions with save_memory, always with the reason. When something "
+        "findings and decisions with save_memory, always with the reason, and with a source "
+        "(a URL, transaction hash, file name or short note) whenever you have one. When something "
         "you remembered turns out to be outdated or wrong, use update_memory on it "
         "instead of saving a duplicate. Use delete_memory only for memories you wrote "
         "that are wrong and shouldn't be kept at all. Memories are private to you unless you share "
         "them with specific agent IDs (visibility='shared', shared_with=[...]). Every "
         "memory is signed; find_memory shows 'verified' or 'NOT verified' for each one: "
-        "treat NOT verified memories with suspicion."
+        "treat NOT verified memories with suspicion. A memory marked 'no source' says who "
+        "claimed it but not where it came from, so it can't be checked."
     ),
 )
 
@@ -193,8 +195,12 @@ async def _run(action):
 @mcp.tool()
 async def save_memory(note: str, reason: str, topic: str, ctx: Context,
                       confidence: str = "medium", visibility: str = "private",
-                      shared_with: list[str] | None = None) -> dict:
+                      shared_with: list[str] | None = None, source: str | None = None) -> dict:
     """Save a note or decision to long-term memory, with the reason behind it.
+
+    Add a source whenever you can, so readers can check the claim itself, not just who
+    made it. The source is signed with the memory: changing it breaks the signature.
+    Memories saved without one are shown as "no source".
 
     Args:
         note: What to remember: a finding, fact or decision. Make it understandable on its own.
@@ -203,10 +209,14 @@ async def save_memory(note: str, reason: str, topic: str, ctx: Context,
         confidence: How sure you are: "low", "medium" or "high".
         visibility: "private" (only you can read it) or "shared" (you plus shared_with).
         shared_with: For shared memories: the agent IDs allowed to read it, e.g. ["trader"].
+        source: Optional: where the information came from, so it can be checked. A URL
+            ("https://..."), a transaction hash ("0x..."), a file name ("q3-report.pdf")
+            or a short note ("Call with Acme's CFO, 12 Nov"). Up to 500 characters.
     """
     agent_id, account = _writer(ctx)
     return await _run(memoria.save_memory(agent_id, note, reason, topic, confidence,
-                                          visibility, shared_with, account=account))
+                                          visibility, shared_with, account=account,
+                                          source=source))
 
 
 @mcp.tool()
@@ -215,6 +225,9 @@ async def find_memory(query: str, ctx: Context, topic: str | None = None,
     """Search past memories by topic or question. Best matches come first.
 
     Only returns memories you are allowed to read: your own, plus ones shared with you.
+    Each memory comes with its signature check ("verified" or "NOT verified") and its
+    "source": where the claim came from, or "no source" if none was given, in which
+    case the claim can't be checked.
 
     Args:
         query: A question or keywords, e.g. "What do we know about Chainlink's token?"
@@ -231,6 +244,8 @@ async def find_memory(query: str, ctx: Context, topic: str | None = None,
 async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context,
                         confidence: str | None = None, topic: str | None = None) -> dict:
     """Update an existing memory with new information. The old version is kept in history.
+
+    The memory keeps its source, which is signed again with the new version.
 
     You can update memories you wrote or that were shared with you.
 

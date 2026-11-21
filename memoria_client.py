@@ -145,8 +145,9 @@ class Memoria:
         return _result(await self._session.call_tool(tool, args))
 
     async def save(self, note, reason, topic, confidence="medium", visibility="private",
-                   shared_with=None) -> dict:
+                   shared_with=None, source=None) -> dict:
         return await self._call("save_memory", note=note, reason=reason, topic=topic,
+                                source=source,
                                 confidence=confidence, visibility=visibility,
                                 shared_with=shared_with)
 
