@@ -36,7 +36,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS memories (
     confidence    TEXT NOT NULL,
     note          TEXT NOT NULL,
     reason        TEXT NOT NULL,
+    source        TEXT,                         -- where the claim came from (optional)
     updated_at    TEXT,
     updated_by    TEXT,
     visibility    TEXT NOT NULL DEFAULT 'private',
@@ -126,7 +127,7 @@ CREATE INDEX IF NOT EXISTS key_requests_by_account ON key_requests(account);
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
-                 "reason", "updated_at", "updated_by", "visibility", "shared_with", "signature",
+                 "reason", "source", "updated_at", "updated_by", "visibility", "shared_with", "signature",
                  "history", "needs_sync", "sync_version", "processed", "added_version",
                  "data_id", "dataset_id")
 JSON_FIELDS = {"shared_with": [], "signature": None, "history": []}
@@ -152,6 +153,9 @@ def connection() -> sqlite3.Connection:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")   # wait for another program's write
             conn.executescript(SCHEMA)
+            # Version 2 added memories.source; older databases get the column, empty.
+            if "source" not in {row[1] for row in conn.execute("PRAGMA table_info(memories)")}:
+                conn.execute("ALTER TABLE memories ADD COLUMN source TEXT")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)
