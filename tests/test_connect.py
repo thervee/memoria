@@ -76,8 +76,9 @@ def test_bridge_passes_tools_and_calls_through(memoria_url):
 
     async def scenario():
         tools = await list_tools(None, None)
-        assert {t.name for t in tools.tools} == {"save_memory", "find_memory", "update_memory",
-                                                 "share_memory", "delete_memory"}
+        assert {t.name for t in tools.tools} == {"save_memory", "find_memory", "list_memories",
+                                                 "update_memory", "share_memory",
+                                                 "delete_memory"}
         result = await call_tool(None, types.CallToolRequestParams(
             name="save_memory",
             arguments={"note": "Owls hunt at night.", "reason": "test", "topic": "test/birds"}))

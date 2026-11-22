@@ -450,6 +450,30 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
     return [_public(m) for m in found[:limit]]
 
 
+LIST_DEFAULT, LIST_MAX = 20, 100
+
+
+async def list_memories(agent_id: str, topic: str | None = None, saved_by: str | None = None,
+                        limit: int = LIST_DEFAULT, account: str = LOCAL) -> list[dict]:
+    """The memories this agent may read (its own, plus ones shared with it), newest first.
+
+    topic matches that topic and everything under it ("customers/" or "customers" also
+    finds "customers/acme"). Uses the same permission check as find_memory.
+    """
+    agent_id = check_agent(agent_id, account)
+    topic = (topic or "").strip().strip("/") or None
+    if topic and len(topic) > MAX_LENGTHS["topic"]:
+        raise MemoriaError(f"topic can be {MAX_LENGTHS['topic']} characters at most.")
+    try:
+        limit = max(1, min(int(LIST_DEFAULT if limit is None else limit), LIST_MAX))
+    except (TypeError, ValueError):
+        raise MemoriaError(f"limit must be a number from 1 to {LIST_MAX}.") from None
+    _log(identity.principal(account, agent_id), "list", topic=topic, saved_by=saved_by)
+    found = db.visible_memories(account, agent_id, topic_under=topic, saved_by=saved_by,
+                                limit=limit)
+    return [_public(m) for m in found if can_see(m, agent_id, account)]
+
+
 def _chunks(results) -> list[dict]:
     """Cognee may wrap search results per dataset; flatten them into passages."""
     out = []

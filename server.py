@@ -242,6 +242,26 @@ async def find_memory(query: str, ctx: Context, topic: str | None = None,
 
 
 @mcp.tool()
+async def list_memories(ctx: Context, topic: str | None = None, saved_by: str | None = None,
+                        limit: int = 20) -> list[dict]:
+    """List the memories you are allowed to read, newest first (no search question needed).
+
+    Only lists your own memories plus ones shared with you. Each memory comes with its
+    signature check ("verified" or "NOT verified") and its source, like find_memory.
+
+    Args:
+        topic: Optional: only this topic and everything under it, e.g. "customers" or
+            "customers/" also lists "customers/acme".
+        saved_by: Optional: only memories saved by this agent ID.
+        limit: How many memories to return (1-100, default 20).
+    """
+    agent_id, account = _agent(ctx)
+    if demo.is_read_only(account):  # the public demo keys may only use find_memory
+        raise ToolError("The demo key can only use find_memory.")
+    return await _run(memoria.list_memories(agent_id, topic, saved_by, limit, account=account))
+
+
+@mcp.tool()
 async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context,
                         confidence: str | None = None, topic: str | None = None) -> dict:
     """Update an existing memory with new information. The old version is kept in history.

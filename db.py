@@ -290,8 +290,12 @@ def memories_by_data_id(account: str, data_ids: list[str]) -> dict[str, dict]:
 
 def visible_memories(account: str, agent_id: str, *, waiting: bool = False,
                      topic: str | None = None, saved_by: str | None = None,
-                     limit: int | None = None) -> list[dict]:
-    """Memories this agent may read (its own, plus ones shared with it), newest first."""
+                     limit: int | None = None, topic_under: str | None = None) -> list[dict]:
+    """Memories this agent may read (its own, plus ones shared with it), newest first.
+
+    topic: topics containing this text. topic_under: this topic and everything under it
+    ("customers" matches "customers" and "customers/acme", not "customers-old").
+    """
     sql = ["SELECT * FROM memories WHERE account = ? AND (agent_id = ? OR (visibility = 'shared'"
            " AND EXISTS (SELECT 1 FROM json_each(memories.shared_with) WHERE value = ?)))"]
     params: list = [account, agent_id, agent_id]
@@ -300,6 +304,10 @@ def visible_memories(account: str, agent_id: str, *, waiting: bool = False,
     if topic:
         sql.append("AND instr(lower(topic), lower(?)) > 0")
         params.append(topic.strip())
+    if topic_under:
+        sql.append("AND (lower(topic) = lower(?) OR "
+                   "substr(lower(topic), 1, length(?) + 1) = lower(?) || '/')")
+        params += [topic_under, topic_under, topic_under]
     if saved_by:
         sql.append("AND agent_id = ?")
         params.append(saved_by.strip().lower())

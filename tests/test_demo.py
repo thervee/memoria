@@ -104,3 +104,11 @@ def test_demo_keys_show_sharing_and_are_read_only(demo_keys, devs, memoria_url):
                         await attempt
     asyncio.run(run())
     assert len(demo_memories()) == 3
+
+
+def test_demo_keys_still_only_use_find_memory(demo_keys, memoria_url):
+    async def run():
+        async with Memoria(api_key=demo_keys[demo.AGENT_A], url=memoria_url) as mem:
+            with pytest.raises(Exception, match="can only use find_memory"):
+                await mem.list()
+    asyncio.run(run())

@@ -155,6 +155,9 @@ class Memoria:
         return await self._call("find_memory", query=query, topic=topic, saved_by=saved_by,
                                 limit=limit)
 
+    async def list(self, topic=None, saved_by=None, limit=20) -> list[dict]:
+        return await self._call("list_memories", topic=topic, saved_by=saved_by, limit=limit)
+
     async def update(self, memory_id, new_note, reason, confidence=None, topic=None) -> dict:
         return await self._call("update_memory", memory_id=memory_id, new_note=new_note,
                                 reason=reason, confidence=confidence, topic=topic)
