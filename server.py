@@ -329,6 +329,7 @@ def build_app():
                             print(f"Memoria demo key not set up: {e}", file=sys.stderr)
                     memoria.start_background_work()
                     backup.start()  # daily backups of memory_store
+                    memoria.log_memory("after startup")
                 return message
             return await agents_app(scope, receive_and_resume, send)
         if scope["type"] == "http" and scope["path"] == "/health":

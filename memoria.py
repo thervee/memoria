@@ -28,11 +28,19 @@ Where things are kept (all inside the memory_store folder):
 Saving is fast: save, update and delete only change Memoria's database and answer
 straight away. A background worker then does the slow part (Cognee reading the
 memory with Gemini and adding it to the knowledge graph), one job at a time,
-grouping memories that arrive together into one run. Until it is done the
+grouping memories that arrive together into one run (at most RUN_SIZE of them, so
+a burst of saves can't make one run use too much memory).
+
+Cognee and its search model are only loaded the first time they're needed (a search
+of stored memories, or background work), not at start-up, to keep memory use low.
+After every background run Memoria frees what it can and logs how much memory it
+uses ("Memoria memory: ... MB"), so it can be watched in the host's logs. Until it is done the
 memory is marked "processing" and find_memory finds it by its exact words.
 Nothing is lost if Memoria stops: the worker picks up unfinished work next start.
 """
 import asyncio
+import ctypes
+import gc
 import json
 import re
 import secrets
@@ -44,8 +52,9 @@ from uuid import UUID
 import accounts
 import db
 import identity
-from setup_cognee import STORE, cognee
-from cognee import SearchType
+from paths import STORE
+
+cognee = None  # Cognee, loaded the first time it's needed: see _engine()
 
 DATASET = "memoria"
 ACTIVITY_FILE = STORE / "activity.log"
@@ -65,8 +74,69 @@ _cognee_lock = asyncio.Lock()  # held by the background worker while it changes 
 FORGET_GIVE_UP = 5  # stop retrying a Cognee removal after this many failures
 
 
+RUN_SIZE = 3  # at most this many memories in one background run
+
+
 class MemoriaError(ValueError):
     """A problem with what the agent asked for, explained in plain words."""
+
+
+# ---------- Cognee, loaded on first use, and memory use ----------
+
+def _engine():
+    """Cognee, loading it (and Memoria's memory limits for it) the first time it's used."""
+    global cognee
+    if cognee is None:
+        from setup_cognee import cognee as loaded
+        cognee = loaded
+        log_memory("after loading Cognee")
+    return cognee
+
+
+def memory_mb() -> int | None:
+    """How much memory this process uses right now, in MB (None if unknown)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as f:  # Linux (Railway)
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    if sys.platform == "win32":  # this laptop
+        try:
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
+                            ("peak", ctypes.c_size_t), ("now", ctypes.c_size_t)] +                            [(f"x{i}", ctypes.c_size_t) for i in range(7)]
+            kernel = ctypes.windll.kernel32
+            kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                                       ctypes.POINTER(Counters), wintypes.DWORD]
+            c = Counters()
+            c.cb = ctypes.sizeof(c)
+            if kernel.K32GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(c), c.cb):
+                return c.now // (1024 * 1024)
+        except (AttributeError, OSError):
+            pass
+    return None
+
+
+def log_memory(when: str) -> None:
+    """Write one line like "Memoria memory: 312 MB (after startup)" to the server log."""
+    mb = memory_mb()
+    if mb is not None:
+        print(f"Memoria memory: {mb} MB ({when})", file=sys.stderr, flush=True)
+
+
+def _free_memory() -> None:
+    """Give back memory that a finished background run no longer needs."""
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:  # ask the C memory allocator to return freed memory to the system
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
 
 
 # ---------- small helpers ----------
@@ -346,7 +416,8 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
     # 1. Ask Cognee for the stored passages closest in meaning to the question.
     #    (If none of this account's memories are in Cognee yet, there's nothing to search.)
     if db.has_searchable(account):
-        results = await cognee.search(
+        from cognee import SearchType
+        results = await _engine().search(
             query, query_type=SearchType.CHUNKS, datasets=[dataset_for(account)],
             top_k=max(50, limit * 10)
         )
@@ -542,6 +613,8 @@ async def _work_loop() -> None:
     while db.has_work():
         async with _cognee_lock:  # a backup can pause the worker between passes
             succeeded = await _work_once()
+        _free_memory()
+        log_memory("after background processing")
         if succeeded:
             wait = 15
         else:  # e.g. Gemini is down or over its limit: back off, up to 10 minutes
@@ -556,7 +629,7 @@ async def _work_once() -> bool:
     # 1. Remove deleted memories from Cognee.
     for item in db.forget_queue():
         try:
-            await cognee.forget(data_id=UUID(item["data_id"]),
+            await _engine().forget(data_id=UUID(item["data_id"]),
                                 dataset_id=UUID(item["dataset_id"]))
             removed = True
         except Exception as e:
@@ -565,9 +638,9 @@ async def _work_once() -> bool:
         if db.forget_tried(item["data_id"], done=removed, give_up_after=FORGET_GIVE_UP):
             _log("memoria", "background_gave_up", memory_id=item["memory_id"])
 
-    # 2. Send new and changed memories to Cognee.
+    # 2. Send new and changed memories to Cognee (a few at a time: see RUN_SIZE).
     added = []
-    for mem in db.waiting_memories():
+    for mem in db.waiting_memories()[:RUN_SIZE]:
         node_set = [f"account:{account_of(mem)}", f"agent:{mem['agent_id']}",
                     f"topic:{mem['topic']}"]
         try:
@@ -578,14 +651,14 @@ async def _work_once() -> bool:
                 added.append(mem)
             elif mem.get("data_id"):
                 # Already in Cognee: replace it. Cognee rebuilds its part of the graph itself.
-                result = await cognee.update(data_id=UUID(mem["data_id"]), data=_as_text(mem),
+                result = await _engine().update(data_id=UUID(mem["data_id"]), data=_as_text(mem),
                                              dataset_id=UUID(mem["dataset_id"]),
                                              node_set=node_set)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(result["error"])
                 db.mark_synced(mem["id"], mem["sync_version"], processed=True)
             else:
-                result = await cognee.add(_as_text(mem), dataset_name=dataset_for(account_of(mem)),
+                result = await _engine().add(_as_text(mem), dataset_name=dataset_for(account_of(mem)),
                                           node_set=node_set)
                 data_id, dataset_id = str(result.data_ids[0]), str(result.dataset_id)
                 if db.record_added(mem["id"], data_id, dataset_id, mem["sync_version"]):
@@ -599,7 +672,7 @@ async def _work_once() -> bool:
     # 3. Cognee reads all newly added memories in ONE run and builds the graph.
     if added:
         try:
-            await cognee.cognify(datasets=sorted({dataset_for(account_of(m)) for m in added}))
+            await _engine().cognify(datasets=sorted({dataset_for(account_of(m)) for m in added}))
         except Exception as e:
             _background_error("building the knowledge graph", e)
             return False  # the memories stay "processing"; next pass tries again
