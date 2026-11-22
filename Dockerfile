@@ -27,6 +27,10 @@ COPY paths.py setup_cognee.py server.py memoria.py db.py accounts.py identity.py
 ENV MEMORIA_ONLINE=1 \
     MEMORIA_DATA_DIR=/data
 
+# Keep memory use down on a many-CPU host (Railway shows 32 CPUs): without this, the
+# C memory allocator keeps separate memory pools for many threads.
+ENV MALLOC_ARENA_MAX=2
+
 # Settings that aren't secret (the same as .env.example). Secrets are NOT set here:
 # add LLM_API_KEY and MEMORIA_SECRET_KEY as variables in Railway.
 ENV LLM_PROVIDER=gemini \

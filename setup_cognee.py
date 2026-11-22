@@ -10,6 +10,14 @@ Memory limits (each can be changed with the environment variable of the same nam
   EMBEDDING_BATCH_SIZE    texts the search model turns into vectors at once (default 8)
   EMBEDDING_MAX_CONCURRENT_DATA_POINTS   texts waiting for the model at once (default 16)
   MEMORIA_EMBEDDING_THREADS   CPU threads the search model uses (default 2)
+  KUZU_NUM_THREADS        threads the graph database uses (default 2; Cognee's default is
+                          one per CPU, and Railway shows 32)
+  GRAPH_DATABASE_SUBPROCESS_ENABLED, VECTOR_DB_SUBPROCESS_ENABLED
+                          false: Cognee's graph and vector databases run inside Memoria's
+                          process. Cognee's default starts a helper process for them (per
+                          dataset), each with its own copy of Python and libraries (60-190
+                          MB each). Memoria is one process with one background worker, so
+                          it doesn't need them.
 The search model (fastembed) is also told to give its working memory back after every
 batch instead of keeping it for next time.
 """
@@ -33,6 +41,9 @@ os.environ.setdefault("FASTEMBED_CACHE_PATH", str(STORE / "models"))
 os.environ.setdefault("KUZU_BUFFER_POOL_SIZE", str(128 * 1024 * 1024))  # a power of 2
 os.environ.setdefault("EMBEDDING_BATCH_SIZE", "8")
 os.environ.setdefault("EMBEDDING_MAX_CONCURRENT_DATA_POINTS", "16")
+os.environ.setdefault("KUZU_NUM_THREADS", "2")
+os.environ.setdefault("GRAPH_DATABASE_SUBPROCESS_ENABLED", "false")
+os.environ.setdefault("VECTOR_DB_SUBPROCESS_ENABLED", "false")
 
 import importlib  # noqa: E402
 
