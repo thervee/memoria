@@ -619,3 +619,46 @@ def test_older_databases_get_the_new_tables(keys, tmp_path, monkeypatch):
     tables = {r[0] for r in db.query("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"billing", "wallets", "wallet_challenges", "payments"} <= tables
     assert accounts.get_account("acme")["id"] == "acme"  # existing data kept
+
+
+# ---------- linking a wallet by hand (manage_accounts.py link-wallet / unlink-wallet) ----------
+
+def test_admin_links_a_wallet_without_a_signature(on, chain, capsys):
+    wallet = Account.create().address
+    manage_accounts.main(["link-wallet", "acme", wallet])
+    assert "Linked" in capsys.readouterr().out
+    row = db.query("SELECT account, agent, linked_at FROM wallets WHERE address = ?",
+                   (wallet.lower(),))[0]
+    assert row["account"] == "acme" and row["agent"] == "admin" and row["linked_at"]
+    entry = [e for e in (m.json.loads(line) for line in m.ACTIVITY_FILE.read_text()
+                         .splitlines()) if e["action"] == "link_wallet"][-1]
+    assert entry["agent"] == "acme/admin" and entry["by"] == "host"
+    assert entry["wallet"] == wallet.lower() and entry["linked_at"] == row["linked_at"]
+    # payments from it can now be claimed, like any linked wallet
+    assert claim(chain.add(tx_hash(70), [transfer(wallet)]))["credits"] == 1
+
+
+def test_admin_link_follows_the_same_rules(on):
+    wallet = link("globex")
+    with pytest.raises(SystemExit):
+        manage_accounts.main(["link-wallet", "acme", wallet.address])  # another account's
+    with pytest.raises(SystemExit):
+        manage_accounts.main(["link-wallet", "acme", "0x1234"])        # not an address
+    with pytest.raises(SystemExit):
+        manage_accounts.main(["link-wallet", "nobody", Account.create().address])
+    assert billing.wallets_of("acme") == []
+    assert billing.admin_link_wallet("globex", wallet.address)["already_linked"] is True
+
+
+def test_admin_unlinks_a_wallet(on, chain, capsys):
+    wallet = Account.create().address
+    billing.admin_link_wallet("acme", wallet)
+    with pytest.raises(SystemExit):
+        manage_accounts.main(["unlink-wallet", "globex", wallet])  # not globex's to unlink
+    assert billing.wallets_of("acme") == [wallet.lower()]
+    manage_accounts.main(["unlink-wallet", "acme", wallet])
+    assert "Unlinked" in capsys.readouterr().out and billing.wallets_of("acme") == []
+    with pytest.raises(billing.BillingError, match="isn't linked to your account"):
+        claim(chain.add(tx_hash(71), [transfer(wallet)]))
+    assert "unlink_wallet" in [m.json.loads(line)["action"] for line in
+                               m.ACTIVITY_FILE.read_text().splitlines()]

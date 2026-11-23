@@ -82,7 +82,9 @@ made public at `/purchases/<account>` with `manage_accounts.py public-purchases 
 Settings (Railway Variables): `MEMORIA_BILLING`, `MEMORIA_TREASURY_ADDRESS`, `MEMORIA_TOKEN_ADDRESS`,
 `MEMORIA_CHAIN_ID`, `MEMORIA_RPC_URL`, `MEMORIA_TOKENS_PER_CREDIT`, `MEMORIA_ACTIONS_PER_CREDIT`,
 `MEMORIA_STARTER_CREDITS`, `MEMORIA_MIN_CONFIRMATIONS` (defaults and meanings in `.env.example`).
-Host commands: `manage_accounts.py balance <account>`, `add-credits` / `remove-credits <account> <credits>`.
+Host commands: `manage_accounts.py balance <account>`, `add-credits` / `remove-credits <account> <credits>`,
+and `link-wallet` / `unlink-wallet <account> <address>`: wallets that can't sign messages can ask
+Memoria to link them by hand (recorded with agent "admin" and logged).
 
 ## Saving is instant; processing happens in the background
 Saving, updating and deleting answer straight away. The slow part (Gemini reading the memory and

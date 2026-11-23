@@ -24,6 +24,12 @@ Paying with $MEMORIA (see billing.py):
         Change a balance by hand (1 credit = MEMORIA_ACTIONS_PER_CREDIT actions). Logged.
     python manage_accounts.py public-purchases <account> on|off
         Show (or hide) the account's purchase history at /purchases/<account>.
+    python manage_accounts.py link-wallet <account> <address>
+        Link a wallet to an account by hand, without a signature, for agents whose
+        wallets can't sign messages. A wallet can belong to only one account; the link is
+        recorded with agent "admin" and logged.
+    python manage_accounts.py unlink-wallet <account> <address>
+        Unlink a wallet from an account (payments already claimed stay claimed). Logged.
 
 Changes take effect straight away, even while Memoria is running.
 """
@@ -107,6 +113,10 @@ def main(argv=None) -> None:
         change.add_argument("account")
         change.add_argument("credits", type=int)
         change.add_argument("--reason", default="")
+    for name in ("link-wallet", "unlink-wallet"):
+        wallet = commands.add_parser(name)
+        wallet.add_argument("account")
+        wallet.add_argument("address")
     public = commands.add_parser("public-purchases")
     public.add_argument("account")
     public.add_argument("setting", choices=["on", "off"])
@@ -155,6 +165,14 @@ def main(argv=None) -> None:
             print(f"{'Added' if sign > 0 else 'Removed'} {args.credits} credits. "
                   f"'{args.account}' now has {info['actions']} actions "
                   f"({info['credits']} credits).")
+        elif args.command == "link-wallet":
+            done = billing.admin_link_wallet(args.account, args.address)
+            print(f"{'Already linked' if done['already_linked'] else 'Linked'} "
+                  f"{done['linked']} to '{args.account}'. Wallets: {', '.join(done['wallets'])}")
+        elif args.command == "unlink-wallet":
+            done = billing.admin_unlink_wallet(args.account, args.address)
+            print(f"Unlinked {done['unlinked']} from '{args.account}'. "
+                  f"Wallets left: {', '.join(done['wallets']) or 'none'}")
         elif args.command == "public-purchases":
             billing.set_public_purchases(args.account, args.setting == "on")
             print(f"Purchase history for '{args.account}' is now "

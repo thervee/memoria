@@ -356,6 +356,49 @@ def link_wallet(account: str, agent: str, address: str, signature: str) -> dict:
     return {"linked": address.lower(), "wallets": wallets_of(account)}
 
 
+ADMIN_AGENT = "admin"  # the agent recorded for wallets the host links by hand
+
+
+def admin_link_wallet(account: str, address: str) -> dict:
+    """The host links a wallet to an account by hand, without a signature (for agents
+    whose wallets can't sign messages). Same rules as link_wallet: a valid address, and
+    a wallet can belong to only one account."""
+    address = (address or "").strip()
+    if accounts.get_account(account) is None:
+        raise BillingError(f"No account called '{account}'.")
+    if not ADDRESS.match(address):
+        raise BillingError("That isn't a wallet address (0x and 40 hex characters).")
+    now = _now()
+    with db.transaction() as conn:
+        owner = conn.execute("SELECT account FROM wallets WHERE address = ?",
+                             (address.lower(),)).fetchone()
+        if owner and owner["account"] != account:
+            raise BillingError("That wallet is already linked to another Memoria account. "
+                               "A wallet can belong to only one account.")
+        if owner is None:
+            conn.execute("INSERT INTO wallets (address, account, agent, linked_at) "
+                         "VALUES (?, ?, ?, ?)", (address.lower(), account, ADMIN_AGENT, now))
+    if owner is None:
+        _log(account, ADMIN_AGENT, "link_wallet", wallet=address.lower(), by="host",
+             linked_at=now)
+    return {"linked": address.lower(), "already_linked": owner is not None,
+            "wallets": wallets_of(account)}
+
+
+def admin_unlink_wallet(account: str, address: str) -> dict:
+    """The host unlinks a wallet from an account. Payments already claimed stay claimed."""
+    address = (address or "").strip()
+    if not ADDRESS.match(address):
+        raise BillingError("That isn't a wallet address (0x and 40 hex characters).")
+    removed = db.execute("DELETE FROM wallets WHERE address = ? AND account = ?",
+                         (address.lower(), account))
+    if not removed:
+        raise BillingError(f"That wallet isn't linked to '{account}'.")
+    _log(account, ADMIN_AGENT, "unlink_wallet", wallet=address.lower(), by="host",
+         unlinked_at=_now())
+    return {"unlinked": address.lower(), "wallets": wallets_of(account)}
+
+
 # ---------- claiming a payment ----------
 
 def _rpc_call(url: str, method: str, params: list):
