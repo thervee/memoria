@@ -207,11 +207,25 @@ async def _charged(account: str, agent_id: str, tool: str, work):
     except billing.BillingError as e:
         raise ToolError(str(e)) from e
     try:
-        return await _run(work())
+        result = await _run(work())
     except BaseException:
         if charged:
             billing.refund(account, agent_id, tool)
         raise
+    return _noted(account, result)
+
+
+def _noted(account: str, result):
+    """Add a short "balance low" note when the account is nearly out of actions
+    (on a list of memories, it goes on the first one)."""
+    note = billing.low_balance_note(account)
+    if not note:
+        return result
+    if isinstance(result, dict):
+        return {**result, "balance_note": note}
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        return [{**result[0], "balance_note": note}, *result[1:]]
+    return result
 
 
 @mcp.tool()
@@ -305,15 +319,16 @@ async def record_outcome(memory_id: str, result: str, ctx: Context, note: str = 
         note: Optional: what happened, up to 500 characters, e.g. "rugged".
     """
     agent_id, account = _writer(ctx)
-    return await _run(memoria.record_outcome(agent_id, memory_id, result, note,
-                                             account=account))
+    return _noted(account, await _run(memoria.record_outcome(agent_id, memory_id, result, note,
+                                                             account=account)))
 
 
 @mcp.tool()
 async def get_outcomes(memory_id: str, ctx: Context) -> dict:
     """Every outcome recorded for a memory, newest first, each with its signature check.
 
-    Only for memories you can read: your own or ones shared with you.
+    Only for memories you can read: your own or ones shared with you. When billing is on,
+    this uses 1 action, like find_memory.
 
     Args:
         memory_id: The memory's ID, from find_memory or list_memories.
@@ -321,7 +336,8 @@ async def get_outcomes(memory_id: str, ctx: Context) -> dict:
     agent_id, account = _agent(ctx)
     if demo.is_read_only(account):  # the public demo keys may only use find_memory
         raise ToolError("The demo key can only use find_memory.")
-    return await _run(memoria.get_outcomes(agent_id, memory_id, account=account))
+    return await _charged(account, agent_id, "get_outcomes", lambda: memoria.get_outcomes(
+        agent_id, memory_id, account=account))
 
 
 @mcp.tool()
@@ -357,8 +373,14 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
     """
     agent_id, account = _writer(ctx)
-    return await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
-                                           account=account))
+    result = await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
+                                             account=account))
+    if billing.is_billed(account) and result.get("shared_with"):
+        result["billing_note"] = (
+            "The agents you shared this with spend their own account's actions (this "
+            "account's balance, since all its agents share one) when they find or list it: "
+            "1 action each time.")
+    return _noted(account, result)
 
 
 @mcp.tool()
@@ -372,7 +394,8 @@ async def delete_memory(memory_id: str, ctx: Context) -> dict:
         memory_id: The memory's ID (like "mem-1a2b3c4d"), from find_memory or save_memory.
     """
     agent_id, account = _writer(ctx)
-    return await _run(memoria.delete_memory(agent_id, memory_id, account=account))
+    return _noted(account, await _run(memoria.delete_memory(agent_id, memory_id,
+                                                            account=account)))
 
 
 # ---------- paying with $MEMORIA (only offered when MEMORIA_BILLING=on; see billing.py) ----------
@@ -403,7 +426,7 @@ async def wallet_challenge(ctx: Context) -> dict:
     Signing is free and does not move any tokens.
     """
     agent_id, account = _payer(ctx)
-    return await _billing(lambda: billing.challenge(account, agent_id))
+    return _noted(account, await _billing(lambda: billing.challenge(account, agent_id)))
 
 
 async def link_wallet(address: str, signature: str, ctx: Context) -> dict:
@@ -417,7 +440,8 @@ async def link_wallet(address: str, signature: str, ctx: Context) -> dict:
         signature: The wallet's personal_sign signature of the challenge message (0x...).
     """
     agent_id, account = _payer(ctx)
-    return await _billing(lambda: billing.link_wallet(account, agent_id, address, signature))
+    return _noted(account, await _billing(
+        lambda: billing.link_wallet(account, agent_id, address, signature)))
 
 
 async def claim_payment(tx_hash: str, ctx: Context) -> dict:
@@ -431,15 +455,17 @@ async def claim_payment(tx_hash: str, ctx: Context) -> dict:
         tx_hash: The payment's transaction hash (0x and 64 hex characters).
     """
     agent_id, account = _payer(ctx)
-    return await _billing(lambda: billing.claim(account, agent_id, tx_hash))
+    return _noted(account, await _billing(lambda: billing.claim(account, agent_id, tx_hash)))
 
 
 async def get_balance(ctx: Context) -> dict:
-    """How many actions your account has left (also shown as credits), its linked wallets
-    and how to pay. save, update, find and list each use 1 action; share and delete are free.
+    """How many actions your account has left (also shown as credits), its linked wallets,
+    how to pay, and what costs an action. save_memory, update_memory, find_memory,
+    list_memories and get_outcomes each use 1 action; record_outcome, share_memory,
+    delete_memory, get_balance, wallet_challenge, link_wallet and claim_payment are free.
     """
     agent_id, account = _payer(ctx)
-    return await _billing(lambda: billing.balance(account, agent_id))
+    return _noted(account, await _billing(lambda: billing.balance(account, agent_id)))
 
 
 BILLING_TOOLS = (wallet_challenge, link_wallet, claim_payment, get_balance)

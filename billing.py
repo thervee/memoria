@@ -4,10 +4,13 @@ How it works:
   - Each developer account has a balance of ACTIONS. 1 credit = MEMORIA_ACTIONS_PER_CREDIT
     actions (default 2), and costs MEMORIA_TOKENS_PER_CREDIT $MEMORIA (default 10,000).
     Balances are kept in actions, so half-credits are never needed.
-  - With billing on, save_memory, update_memory, find_memory and list_memories each use
-    1 action (share and delete are free). The action is taken before the work and given
-    back if the work fails. The "local" account (this laptop) and the public demo
-    account are never charged.
+  - With billing on, save_memory, update_memory, find_memory, list_memories and
+    get_outcomes each use 1 action; record_outcome, share_memory, delete_memory,
+    get_balance, wallet_challenge, link_wallet and claim_payment are free. The action is
+    taken before the work and given back if the work fails. The "local" account (this
+    laptop) and the public demo account are never charged.
+  - When an account has LOW_BALANCE actions or fewer left, every tool's result carries a
+    short "balance_note" saying so, with the pay page link.
   - New accounts get MEMORIA_STARTER_CREDITS credits (default 10) once. Accounts that
     existed before billing was turned on get them once, the first time billing is on.
   - To pay, an account links a wallet (wallet_challenge, then link_wallet with the
@@ -69,7 +72,11 @@ TX_HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
 SIGNATURE = re.compile(r"^(0x)?[0-9a-fA-F]{130}$")
 CHALLENGE_MINUTES = 10
 NEVER_CHARGED = {identity.LOCAL, demo.ACCOUNT}
-CHARGED_ACTIONS = ("save_memory", "update_memory", "find_memory", "list_memories")
+CHARGED_ACTIONS = ("save_memory", "update_memory", "find_memory", "list_memories",
+                   "get_outcomes")
+FREE_ACTIONS = ("record_outcome", "share_memory", "delete_memory", "get_balance",
+                "wallet_challenge", "link_wallet", "claim_payment")
+LOW_BALANCE = 4  # at or below this many actions, results carry a "balance low" note
 
 
 class BillingError(ValueError):
@@ -206,6 +213,20 @@ def refund(account: str, agent: str, action: str) -> None:
     _log(account, agent, "refund", tool=action)
 
 
+def low_balance_note(account: str) -> str | None:
+    """A short note when a billed account is nearly out of actions, else None."""
+    if not is_billed(account):
+        return None
+    row = db.query("SELECT actions, starter_given FROM billing WHERE account = ?", (account,))
+    if not row or not row[0]["starter_given"]:
+        return None  # the starter credits haven't been added yet, so it isn't low
+    actions = row[0]["actions"]
+    if actions > LOW_BALANCE:
+        return None
+    return (f"Balance low: {actions} action{'' if actions == 1 else 's'} left. Buy credits "
+            f"at {pay_page()}.")
+
+
 def wallets_of(account: str) -> list[str]:
     return [r["address"] for r in db.query(
         "SELECT address FROM wallets WHERE account = ? ORDER BY linked_at, address", (account,))]
@@ -228,6 +249,7 @@ def balance(account: str, agent: str = "") -> dict:
                   "actions_per_credit": s["actions_per_credit"]},
         "pay_page": pay_page(),
         "treasury": s["treasury"],
+        "costs": {"1 action each": list(CHARGED_ACTIONS), "free": list(FREE_ACTIONS)},
     }
 
 

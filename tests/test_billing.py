@@ -662,3 +662,83 @@ def test_admin_unlinks_a_wallet(on, chain, capsys):
         claim(chain.add(tx_hash(71), [transfer(wallet)]))
     assert "unlink_wallet" in [m.json.loads(line)["action"] for line in
                                m.ACTIVITY_FILE.read_text().splitlines()]
+
+
+# ---------- what costs an action, and the "balance low" note ----------
+
+def test_get_outcomes_costs_one_action_and_record_outcome_is_free(on, memoria_url):
+    async def work(mem):
+        saved = await mem.save("Token X looked safe.", reason="r", topic="crypto")  # 1
+        await mem.record_outcome(saved["memory_id"], "failure", "rugged")           # free
+        after_record = actions()
+        await mem.outcomes(saved["memory_id"])                                       # 1
+        return after_record
+    assert run_as(on["acme/trader"], memoria_url, work) == 20 - 1
+    assert actions() == 20 - 2
+
+
+def test_free_payment_tools_use_no_actions(on, billing_url):
+    async def work(mem):
+        await mem.balance()
+        await mem.wallet_challenge()
+        return (await mem.balance())["costs"]
+    costs = run_as(on["acme/trader"], billing_url, work)
+    assert actions() == 20
+    assert costs == {"1 action each": ["save_memory", "update_memory", "find_memory",
+                                       "list_memories", "get_outcomes"],
+                     "free": ["record_outcome", "share_memory", "delete_memory", "get_balance",
+                              "wallet_challenge", "link_wallet", "claim_payment"]}
+
+
+def test_a_low_balance_adds_a_note_to_every_result(on, memoria_url):
+    billing.balance("acme")  # starter credits added
+    db.execute("UPDATE billing SET actions = 6 WHERE account = 'acme'")
+
+    async def work(mem):
+        first = await mem.save("Acme renews March 1.", reason="r", topic="customers")  # 5 left
+        second = await mem.save("Acme pays in euros.", reason="r", topic="customers")  # 4 left
+        found = await mem.find("Acme", topic="customers")                              # 3 left
+        none_found = await mem.find("zebra")                                           # 2 left
+        shared = await mem.share(second["memory_id"], "shared", ["analyst"])          # free
+        return first, second, found, none_found, shared
+    first, second, found, none_found, shared = run_as(on["acme/trader"], memoria_url, work)
+    assert "balance_note" not in first  # 5 left: not low yet
+    assert second["balance_note"] == ("Balance low: 4 actions left. Buy credits at "
+                                       "https://www.memoriaagent.site/pay.")
+    assert found[0]["balance_note"].startswith("Balance low: 3 actions left")
+    assert all("balance_note" not in x for x in found[1:])  # once, on the first memory
+    assert none_found == []  # an empty list has nowhere to put it
+    assert shared["balance_note"].startswith("Balance low: 2 actions left")  # free tools too
+
+
+def test_one_action_left_is_said_in_the_singular(on):
+    billing.balance("acme")
+    db.execute("UPDATE billing SET actions = 1 WHERE account = 'acme'")
+    assert billing.low_balance_note("acme").startswith("Balance low: 1 action left.")
+
+
+def test_no_balance_note_when_billing_is_off_or_never_charged(store, devs, monkeypatch):
+    assert billing.low_balance_note("acme") is None  # billing off
+    monkeypatch.setenv("MEMORIA_BILLING", "on")
+    assert billing.low_balance_note("acme") is None  # starter credits not added yet
+    assert billing.low_balance_note("local") is None
+    assert billing.low_balance_note(demo.ACCOUNT) is None
+
+
+def test_share_reminds_who_pays_when_billing_is_on(on, memoria_url):
+    async def work(mem):
+        saved = await mem.save("Acme renews March 1.", reason="r", topic="customers")
+        shared = await mem.share(saved["memory_id"], "shared", ["analyst"])
+        private = await mem.share(saved["memory_id"], "private")
+        return shared, private
+    shared, private = run_as(on["acme/trader"], memoria_url, work)
+    assert "spend their own account's actions" in shared["billing_note"]
+    assert "billing_note" not in private  # shared with nobody
+
+
+def test_share_has_no_billing_reminder_when_billing_is_off(store, devs, memoria_url):
+    async def work(mem):
+        saved = await mem.save("Acme renews March 1.", reason="r", topic="customers")
+        return await mem.share(saved["memory_id"], "shared", ["analyst"])
+    shared = run_as(devs["acme/trader"], memoria_url, work)
+    assert "billing_note" not in shared and "balance_note" not in shared

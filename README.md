@@ -58,8 +58,10 @@ Memoria can be paid for with the $MEMORIA token on Robinhood Chain (see `billing
 until `MEMORIA_BILLING=on`; with it off, nothing changes and the payment tools aren't offered.
 
 - **Price:** 1 credit = 10,000 $MEMORIA = 2 actions. Balances are kept in actions.
-- **What costs an action:** `save_memory`, `update_memory`, `find_memory` and `list_memories` (1 each).
-  `share_memory` and `delete_memory` are free. A failed action is given back.
+- **What costs 1 action:** `save_memory`, `update_memory`, `find_memory`, `list_memories` and `get_outcomes`.
+  **Free:** `record_outcome`, `share_memory`, `delete_memory`, `get_balance`, `wallet_challenge`,
+  `link_wallet` and `claim_payment`. A failed action is given back. With 4 actions or fewer left,
+  every tool's result carries a short "balance low" note with the pay page link.
 - **Starter credits:** every account gets 10 credits (20 actions) once, including accounts made
   before billing was turned on. This laptop's "local" account and the public demo are never charged.
 - **Treasury** (receives payments): `0x7d61Bd6D005B464C9022e1b2FAdD0F16C93E935C`.

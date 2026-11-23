@@ -42,6 +42,7 @@ import asyncio
 import ctypes
 import gc
 import json
+import os
 import re
 import secrets
 import sys
@@ -75,6 +76,11 @@ FORGET_GIVE_UP = 5  # stop retrying a Cognee removal after this many failures
 
 
 RUN_SIZE = 3  # at most this many memories in one background run
+# find_memory only returns passages at least this close in meaning to the question: the
+# search model's cosine distance, where lower is closer. Measured with Memoria's model:
+# good matches 0.13-0.22, loose but real ones 0.31-0.35, nonsense 0.43+, unrelated 0.49+.
+# Change it with MEMORIA_SEARCH_MAX_DISTANCE.
+SEARCH_MAX_DISTANCE = 0.40
 
 
 class MemoriaError(ValueError):
@@ -422,7 +428,7 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
             query, query_type=SearchType.CHUNKS, datasets=[dataset_for(account)],
             top_k=max(50, limit * 10)
         )
-        chunks = _chunks(results)
+        chunks = [c for c in _chunks(results) if _close_enough(c)]
         by_data_id = db.memories_by_data_id(account, [str(c.get("document_id")) for c in chunks])
         for chunk in chunks:
             mem = by_data_id.get(str(chunk.get("document_id")))
@@ -441,7 +447,9 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
                 and words & _words(f"{mem['topic']} {mem['note']} {mem['reason']}"):
             found.append(mem)
 
-    # 3. If a topic was given, top up with the newest memories on that topic.
+    # 3. If a topic was given, top up with the newest memories on that topic (the agent
+    #    asked for that topic, so these aren't unrelated; the relevance threshold applies
+    #    to the search in step 1).
     if topic and len(found) < limit:
         for mem in db.visible_memories(account, agent_id, topic=topic, saved_by=saved_by,
                                        limit=limit + len(found)):
@@ -617,6 +625,23 @@ async def get_outcomes(agent_id: str, memory_id: str, account: str = LOCAL) -> d
             "outcomes": [_outcome_public(o) for o in outcomes]}
 
 
+def _max_distance() -> float:
+    try:
+        return float(os.environ.get("MEMORIA_SEARCH_MAX_DISTANCE", "") or SEARCH_MAX_DISTANCE)
+    except ValueError:
+        return SEARCH_MAX_DISTANCE
+
+
+def _close_enough(chunk: dict) -> bool:
+    """Is this passage close enough in meaning to the question? (Passages without a score
+    are kept: only Cognee's vector search gives one.)"""
+    score = chunk.get("score")
+    try:
+        return score is None or float(score) <= _max_distance()
+    except (TypeError, ValueError):
+        return True
+
+
 def _chunks(results) -> list[dict]:
     """Cognee may wrap search results per dataset; flatten them into passages."""
     out = []
@@ -699,7 +724,20 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
          before={"visibility": before[0], "shared_with": before[1]},
          after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
          **({"via": via} if via else {}))
-    return _public(mem)
+    out = _public(mem)
+    unknown = [a for a in mem["shared_with"] if a not in known_agents(account)]
+    if unknown:
+        out["warning"] = (f"{', '.join(unknown)} {'is' if len(unknown) == 1 else 'are'} not "
+                          f"an agent on this account (yet). The memory is shared anyway: "
+                          f"{'it' if len(unknown) == 1 else 'they'} will be able to read it "
+                          f"if added to the account. Check the spelling if that's a mistake.")
+    return out
+
+
+def known_agents(account: str) -> set[str]:
+    """The agents that exist on an account: every agent with a signing key."""
+    return {agent for name in identity._registry()
+            for acct, agent in [identity.split_principal(name)] if acct == account}
 
 
 async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,

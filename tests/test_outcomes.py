@@ -293,7 +293,8 @@ def test_demo_keys_cant_record_or_read_outcomes(store, memoria_url, monkeypatch)
     assert db.query("SELECT count(*) FROM outcomes")[0][0] == 0
 
 
-def test_recording_outcomes_is_free(memoria_url, devs, monkeypatch, store):
+def test_recording_outcomes_is_free_reading_them_costs_one(memoria_url, devs, monkeypatch,
+                                                            store):
     monkeypatch.setenv("MEMORIA_BILLING", "on")
 
     def actions():
@@ -305,10 +306,12 @@ def test_recording_outcomes_is_free(memoria_url, devs, monkeypatch, store):
             before = actions()
             await mem.record_outcome(saved["memory_id"], "failure", "rugged")
             await mem.record_outcome(saved["memory_id"], "mixed")
+            after_recording = actions()
             await mem.outcomes(saved["memory_id"])
-            return before, actions()
-    before, after = run(scenario())
-    assert before == after == 20 - 1  # only the save used an action
+            return before, after_recording, actions()
+    before, after_recording, after_reading = run(scenario())
+    assert before == after_recording == 20 - 1  # recording outcomes is free
+    assert after_reading == 20 - 2             # get_outcomes uses 1 action
 
 
 # ---------- database ----------
