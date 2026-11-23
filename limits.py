@@ -7,6 +7,7 @@ Used by the server to slow down anyone sending too many requests:
   - per account: all of an account's agents together (account_requests_per_minute)
   - per internet address and overall: sign-ups
   - per internet address and per account: requests for a new agent's API key
+  - per internet address: the pay page's requests (billing.py)
 
 The counts are kept in memory, so they start again when Memoria restarts. That's
 fine for slowing down spam; the daily write limits (memoria.py) are kept on disk.
@@ -77,6 +78,7 @@ signups_per_ip = Window(_setting("MEMORIA_SIGNUPS_PER_IP", 3), 86400)    # per d
 signups_total = Window(_setting("MEMORIA_SIGNUPS_PER_DAY", 50), 86400)   # per day, everyone
 key_requests_per_ip = Window(_setting("MEMORIA_KEY_REQUESTS_PER_IP", 5), 86400)  # per day
 key_emails_per_account = Window(_setting("MEMORIA_KEY_EMAILS_PER_ACCOUNT", 5), 86400)  # per day
+billing_per_ip = Window(_setting("MEMORIA_BILLING_PER_IP", 30), 60)  # pay page requests per minute
 MAX_REQUEST_BYTES = _setting("MEMORIA_MAX_REQUEST_BYTES", 64_000)
 
 
@@ -115,5 +117,5 @@ def is_this_computer(ip: str) -> bool:
 
 def reset_all() -> None:
     for window in (per_ip, failed_logins, per_agent, per_account, signups_per_ip, signups_total,
-                   key_requests_per_ip, key_emails_per_account):
+                   key_requests_per_ip, key_emails_per_account, billing_per_ip):
         window.reset()

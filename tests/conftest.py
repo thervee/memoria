@@ -90,7 +90,10 @@ class FakeCognee:
 def clean_settings(monkeypatch):
     """Every test starts with default settings and empty spam-protection counters."""
     for name in ("MEMORIA_SIGNUP", "MEMORIA_TRUST_PROXY", "MEMORIA_DASHBOARD",
-                 "MEMORIA_API_KEY", "MEMORIA_URL"):
+                 "MEMORIA_API_KEY", "MEMORIA_URL", "MEMORIA_BILLING",
+                 "MEMORIA_TREASURY_ADDRESS", "MEMORIA_TOKEN_ADDRESS", "MEMORIA_CHAIN_ID",
+                 "MEMORIA_RPC_URL", "MEMORIA_TOKENS_PER_CREDIT", "MEMORIA_ACTIONS_PER_CREDIT",
+                 "MEMORIA_STARTER_CREDITS", "MEMORIA_MIN_CONFIRMATIONS"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEMORIA_SECRET_KEY", identity.make_server_secret())
     limits.reset_all()

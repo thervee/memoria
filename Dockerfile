@@ -20,7 +20,7 @@ RUN pip install -r requirements.txt
 
 # Only the code the server needs (listed one by one, so nothing else slips in).
 COPY paths.py setup_cognee.py server.py memoria.py db.py accounts.py identity.py \
-     limits.py signup.py dashboard.py demo.py backup.py restore_backup.py manage_accounts.py ./
+     limits.py signup.py dashboard.py demo.py billing.py backup.py restore_backup.py manage_accounts.py ./
 
 # Run online: listen on 0.0.0.0 and Railway's PORT, dashboard off, trust Railway's
 # proxy for visitors' addresses, and keep every piece of data in /data.

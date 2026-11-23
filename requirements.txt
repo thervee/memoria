@@ -5,6 +5,7 @@ cognee==1.6.8          # the memory engine and knowledge graph (memoria.py, setu
 fastembed==0.9.1       # the free local search model, chosen in .env (EMBEDDING_PROVIDER=fastembed)
 mcp==2.3.0             # the server agents connect to (server.py)
 cryptography==50.0.2   # agent keys, login passes and signatures (identity.py)
+eth-account==0.14.0    # checks wallet signatures when linking a wallet (billing.py)
 python-dotenv==1.2.4   # reads the .env settings file (setup_cognee.py)
 starlette==1.10.0      # the dashboard's web server side (dashboard.py)
 uvicorn==0.54.0        # runs the server on 127.0.0.1:8765 (server.py)

@@ -15,6 +15,10 @@ What's in it:
   invites       sign-up invite codes (hashes only)
   signups       sign-ups waiting for their email link to be clicked (link hashes only)
   key_requests  requests for a new agent's API key, waiting for their email link (hashes only)
+  billing       each developer account's balance of actions and billing settings (billing.py)
+  wallets       wallets linked to an account, to pay with $MEMORIA
+  wallet_challenges  one-time messages a wallet signs to prove it belongs to an account
+  payments      $MEMORIA payments already claimed (each transfer can be claimed only once)
 
 The activity log stays a plain text file (activity.log), easy to read and search.
 
@@ -36,7 +40,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -124,6 +128,44 @@ CREATE TABLE IF NOT EXISTS key_requests (
     used_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS key_requests_by_account ON key_requests(account);
+CREATE TABLE IF NOT EXISTS billing (
+    account          TEXT PRIMARY KEY,
+    actions          INTEGER NOT NULL DEFAULT 0,   -- 1 credit = MEMORIA_ACTIONS_PER_CREDIT actions
+    starter_given    INTEGER NOT NULL DEFAULT 0,   -- 1 once the starter credits were added
+    public_purchases INTEGER NOT NULL DEFAULT 0,   -- 1: /purchases/<account> is public
+    updated_at       TEXT
+);
+CREATE TABLE IF NOT EXISTS wallets (
+    address   TEXT PRIMARY KEY,                    -- lowercase 0x...; one account per wallet
+    account   TEXT NOT NULL,
+    agent     TEXT NOT NULL,
+    linked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS wallets_by_account ON wallets(account);
+CREATE TABLE IF NOT EXISTS wallet_challenges (
+    nonce      TEXT PRIMARY KEY,
+    account    TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS wallet_challenges_by_owner ON wallet_challenges(account, agent);
+CREATE TABLE IF NOT EXISTS payments (
+    tx_hash      TEXT NOT NULL,                    -- lowercase 0x...
+    log_index    INTEGER NOT NULL,
+    account      TEXT NOT NULL,
+    agent        TEXT NOT NULL,
+    from_address TEXT NOT NULL,
+    amount       TEXT NOT NULL,                    -- token units (with 18 decimals), as text
+    credits      INTEGER NOT NULL,                 -- credits and actions of the whole claim are
+    actions      INTEGER NOT NULL,                 -- kept on its first transfer, 0 on the others
+    block_number INTEGER NOT NULL,
+    claimed_at   TEXT NOT NULL,
+    PRIMARY KEY (tx_hash, log_index)              -- so a payment can never be claimed twice
+);
+CREATE INDEX IF NOT EXISTS payments_by_account ON payments(account);
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",

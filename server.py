@@ -27,6 +27,7 @@ which opens without a password but only from this laptop (see dashboard.py).
 
 Start it with start_memoria.bat (or: .venv\\Scripts\\python.exe server.py).
 """
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 import accounts  # noqa: E402
 import backup  # noqa: E402
+import billing  # noqa: E402
 import dashboard  # noqa: E402
 import demo  # noqa: E402
 import identity  # noqa: E402
@@ -193,6 +195,25 @@ async def _run(action):
         raise ToolError(str(e)) from e
 
 
+async def _charged(account: str, agent_id: str, tool: str, work):
+    """Run a memory action that costs 1 action when billing is on (see billing.py).
+
+    The action is taken first, only if the balance is high enough, and given back if
+    the work fails. Never charged: billing off, this laptop ("local") and the demo.
+    `work` makes the action when called, so nothing runs if the balance is empty.
+    """
+    try:
+        charged = billing.charge(account, agent_id, tool)
+    except billing.BillingError as e:
+        raise ToolError(str(e)) from e
+    try:
+        return await _run(work())
+    except BaseException:
+        if charged:
+            billing.refund(account, agent_id, tool)
+        raise
+
+
 @mcp.tool()
 async def save_memory(note: str, reason: str, topic: str, ctx: Context,
                       confidence: str = "medium", visibility: str = "private",
@@ -215,9 +236,9 @@ async def save_memory(note: str, reason: str, topic: str, ctx: Context,
             or a short note ("Call with Acme's CFO, 12 Nov"). Up to 500 characters.
     """
     agent_id, account = _writer(ctx)
-    return await _run(memoria.save_memory(agent_id, note, reason, topic, confidence,
-                                          visibility, shared_with, account=account,
-                                          source=source))
+    return await _charged(account, agent_id, "save_memory", lambda: memoria.save_memory(
+        agent_id, note, reason, topic, confidence, visibility, shared_with, account=account,
+        source=source))
 
 
 @mcp.tool()
@@ -237,8 +258,8 @@ async def find_memory(query: str, ctx: Context, topic: str | None = None,
         limit: How many memories to return (1-20).
     """
     agent_id, account = _agent(ctx)
-    return await _run(memoria.find_memory(agent_id, query, topic, saved_by, limit,
-                                          account=account))
+    return await _charged(account, agent_id, "find_memory", lambda: memoria.find_memory(
+        agent_id, query, topic, saved_by, limit, account=account))
 
 
 @mcp.tool()
@@ -258,7 +279,8 @@ async def list_memories(ctx: Context, topic: str | None = None, saved_by: str | 
     agent_id, account = _agent(ctx)
     if demo.is_read_only(account):  # the public demo keys may only use find_memory
         raise ToolError("The demo key can only use find_memory.")
-    return await _run(memoria.list_memories(agent_id, topic, saved_by, limit, account=account))
+    return await _charged(account, agent_id, "list_memories", lambda: memoria.list_memories(
+        agent_id, topic, saved_by, limit, account=account))
 
 
 @mcp.tool()
@@ -279,8 +301,8 @@ async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context
         topic: Optional new topic label.
     """
     agent_id, account = _writer(ctx)
-    return await _run(memoria.update_memory(agent_id, memory_id, new_note, reason,
-                                            confidence, topic, account=account))
+    return await _charged(account, agent_id, "update_memory", lambda: memoria.update_memory(
+        agent_id, memory_id, new_note, reason, confidence, topic, account=account))
 
 
 @mcp.tool()
@@ -310,6 +332,86 @@ async def delete_memory(memory_id: str, ctx: Context) -> dict:
     """
     agent_id, account = _writer(ctx)
     return await _run(memoria.delete_memory(agent_id, memory_id, account=account))
+
+
+# ---------- paying with $MEMORIA (only offered when MEMORIA_BILLING=on; see billing.py) ----------
+
+def _payer(ctx: Context) -> tuple[str, str]:
+    """The calling agent, if it may use the payment tools."""
+    agent_id, account = _agent(ctx)
+    if account in billing.NEVER_CHARGED:
+        raise ToolError("This key can't use the payment tools.")
+    if not billing.enabled():
+        raise ToolError("Billing is not live yet.")
+    return agent_id, account
+
+
+async def _billing(action):
+    try:
+        result = action()
+        return await result if asyncio.iscoroutine(result) else result
+    except billing.BillingError as e:
+        raise ToolError(str(e)) from e
+
+
+async def wallet_challenge(ctx: Context) -> dict:
+    """Start linking a wallet to your account, so you can pay with $MEMORIA.
+
+    Returns a one-time message (valid 10 minutes). Sign it with your wallet using
+    personal_sign (EIP-191), then call link_wallet with the address and signature.
+    Signing is free and does not move any tokens.
+    """
+    agent_id, account = _payer(ctx)
+    return await _billing(lambda: billing.challenge(account, agent_id))
+
+
+async def link_wallet(address: str, signature: str, ctx: Context) -> dict:
+    """Link a wallet to your account, using its signature of the latest wallet_challenge.
+
+    A wallet can belong to only one account. Payments from a linked wallet to the Memoria
+    treasury can then be claimed with claim_payment.
+
+    Args:
+        address: The wallet address, e.g. "0xAbC...".
+        signature: The wallet's personal_sign signature of the challenge message (0x...).
+    """
+    agent_id, account = _payer(ctx)
+    return await _billing(lambda: billing.link_wallet(account, agent_id, address, signature))
+
+
+async def claim_payment(tx_hash: str, ctx: Context) -> dict:
+    """Add credits for a $MEMORIA payment you sent to the Memoria treasury.
+
+    Send $MEMORIA on Robinhood Chain from a linked wallet to the treasury address, wait for
+    the confirmations, then claim with the transaction hash. Each payment can be claimed
+    only once. 1 credit = 10,000 $MEMORIA = 2 actions (the server's settings decide).
+
+    Args:
+        tx_hash: The payment's transaction hash (0x and 64 hex characters).
+    """
+    agent_id, account = _payer(ctx)
+    return await _billing(lambda: billing.claim(account, agent_id, tx_hash))
+
+
+async def get_balance(ctx: Context) -> dict:
+    """How many actions your account has left (also shown as credits), its linked wallets
+    and how to pay. save, update, find and list each use 1 action; share and delete are free.
+    """
+    agent_id, account = _payer(ctx)
+    return await _billing(lambda: billing.balance(account, agent_id))
+
+
+BILLING_TOOLS = (wallet_challenge, link_wallet, claim_payment, get_balance)
+
+
+def add_billing_tools(server) -> None:
+    """Offer the payment tools on this MCP server."""
+    for tool in BILLING_TOOLS:
+        server.tool()(tool)
+
+
+if billing.enabled():  # with billing off, agents see exactly the same tools as before
+    add_billing_tools(mcp)
 
 
 def _already_running() -> bool:
@@ -358,6 +460,8 @@ def build_app():
             return await dashboard.app(scope, receive, send)
         if scope["type"] == "http" and signup.handles(scope["path"]):
             return await signup.app(scope, receive, send)
+        if scope["type"] == "http" and billing.handles(scope["path"]):
+            return await billing.app(scope, receive, send)
         return await agents_app(scope, receive, send)
 
     return memoria_app

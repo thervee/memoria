@@ -158,6 +158,19 @@ class Memoria:
     async def list(self, topic=None, saved_by=None, limit=20) -> list[dict]:
         return await self._call("list_memories", topic=topic, saved_by=saved_by, limit=limit)
 
+    # Paying with $MEMORIA (only when the host has turned billing on)
+    async def wallet_challenge(self) -> dict:
+        return await self._call("wallet_challenge")
+
+    async def link_wallet(self, address, signature) -> dict:
+        return await self._call("link_wallet", address=address, signature=signature)
+
+    async def claim_payment(self, tx_hash) -> dict:
+        return await self._call("claim_payment", tx_hash=tx_hash)
+
+    async def balance(self) -> dict:
+        return await self._call("get_balance")
+
     async def update(self, memory_id, new_note, reason, confidence=None, topic=None) -> dict:
         return await self._call("update_memory", memory_id=memory_id, new_note=new_note,
                                 reason=reason, confidence=confidence, topic=topic)

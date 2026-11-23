@@ -42,6 +42,37 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
 
+## Paying with $MEMORIA
+Memoria can be paid for with the $MEMORIA token on Robinhood Chain (see `billing.py`). It is **off**
+until `MEMORIA_BILLING=on`; with it off, nothing changes and the payment tools aren't offered.
+
+- **Price:** 1 credit = 10,000 $MEMORIA = 2 actions. Balances are kept in actions.
+- **What costs an action:** `save_memory`, `update_memory`, `find_memory` and `list_memories` (1 each).
+  `share_memory` and `delete_memory` are free. A failed action is given back.
+- **Starter credits:** every account gets 10 credits (20 actions) once, including accounts made
+  before billing was turned on. This laptop's "local" account and the public demo are never charged.
+- **Treasury** (receives payments): `0x7d61Bd6D005B464C9022e1b2FAdD0F16C93E935C`.
+  Memoria only reads the chain; it never holds or asks for a private key.
+
+| Tool (only when billing is on) | What it does |
+|---|---|
+| `wallet_challenge` | A one-time message (10 minutes) for a wallet to sign |
+| `link_wallet` | Links the wallet that signed it (EIP-191 `personal_sign`); one account per wallet |
+| `claim_payment` | Adds credits for a $MEMORIA transfer from a linked wallet to the treasury (after 20 confirmations; once per payment) |
+| `get_balance` | Actions left (also as credits), linked wallets and how to pay |
+
+**How an agent pays:** call `wallet_challenge`, sign the message with its wallet, call `link_wallet`,
+send $MEMORIA from that wallet to the treasury, then call `claim_payment` with the transaction hash.
+**People** pay on the website's pay page, `https://www.memoriaagent.site/pay`, which does the same steps
+with a browser wallet. The pay page uses `/billing/config`, `/billing/challenge`, `/billing/link`,
+`/billing/claim` and `/billing/balance` (API key required, website only). An account's purchases can be
+made public at `/purchases/<account>` with `manage_accounts.py public-purchases <account> on`.
+
+Settings (Railway Variables): `MEMORIA_BILLING`, `MEMORIA_TREASURY_ADDRESS`, `MEMORIA_TOKEN_ADDRESS`,
+`MEMORIA_CHAIN_ID`, `MEMORIA_RPC_URL`, `MEMORIA_TOKENS_PER_CREDIT`, `MEMORIA_ACTIONS_PER_CREDIT`,
+`MEMORIA_STARTER_CREDITS`, `MEMORIA_MIN_CONFIRMATIONS` (defaults and meanings in `.env.example`).
+Host commands: `manage_accounts.py balance <account>`, `add-credits` / `remove-credits <account> <credits>`.
+
 ## Saving is instant; processing happens in the background
 Saving, updating and deleting answer straight away. The slow part (Gemini reading the memory and
 Cognee adding it to its knowledge graph, which can take minutes on the free tier) is done afterwards by
@@ -107,6 +138,7 @@ protect against someone who already controls Memoria and your Windows account on
 | `setup_cognee.py` | Points Cognee at local storage |
 | `memoria.py` | The memory engine (save / find / update) and the background worker |
 | `db.py` | Memoria's database: where memories, agents and accounts are kept |
+| `billing.py` | Paying with $MEMORIA: balances, wallet linking, claiming payments, the pay page's endpoints |
 | `paths.py` | Where data is kept (`MEMORIA_DATA_DIR`) and whether Memoria runs online (`MEMORIA_ONLINE`) |
 | `Dockerfile` / `.dockerignore` / `railway.json` | Everything Railway needs to build and run Memoria |
 | `requirements.txt` | Every package Memoria needs, with exact versions |

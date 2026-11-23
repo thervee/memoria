@@ -17,6 +17,14 @@
     python manage_accounts.py invite                        make a one-time invite code
                                                             (for MEMORIA_SIGNUP=invite)
 
+Paying with $MEMORIA (see billing.py):
+    python manage_accounts.py balance <account>             actions left, wallets, payments
+    python manage_accounts.py add-credits <account> <credits> [--reason "..."]
+    python manage_accounts.py remove-credits <account> <credits> [--reason "..."]
+        Change a balance by hand (1 credit = MEMORIA_ACTIONS_PER_CREDIT actions). Logged.
+    python manage_accounts.py public-purchases <account> on|off
+        Show (or hide) the account's purchase history at /purchases/<account>.
+
 Changes take effect straight away, even while Memoria is running.
 """
 import argparse
@@ -30,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")  # MEMORIA_SECRET_KEY
 
 import accounts  # noqa: E402
+import billing  # noqa: E402
 import db  # noqa: E402
 import identity  # noqa: E402
 
@@ -54,6 +63,23 @@ def show_list() -> None:
           f"Sign-up mode: {accounts.signup_mode()}")
 
 
+def show_balance(account: str) -> None:
+    if accounts.get_account(account) is None:
+        raise billing.BillingError(f"No account called '{account}'.")
+    info = billing.balance(account, "host")
+    public = db.query("SELECT public_purchases FROM billing WHERE account = ?", (account,))
+    print(f"{account}: {info['actions']} actions ({info['credits']} credits)   "
+          f"billing is {info['billing']}   public purchase history: "
+          f"{'on' if public and public[0][0] else 'off'}")
+    print(f"    wallets: {', '.join(info['wallets']) or 'none linked'}")
+    payments = billing.payments_of(account)
+    if not payments:
+        print("    payments: none")
+    for pay in payments:
+        print(f"    {pay['date']}  {pay['tokens']} $MEMORIA = {pay['credits']} credits "
+              f"({pay['actions']} actions)  {pay['explorer']}")
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Manage Memoria developer accounts.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -75,6 +101,15 @@ def main(argv=None) -> None:
     set_limit.add_argument("limit")
     set_limit.add_argument("value")
     commands.add_parser("invite")
+    commands.add_parser("balance").add_argument("account")
+    for name in ("add-credits", "remove-credits"):
+        change = commands.add_parser(name)
+        change.add_argument("account")
+        change.add_argument("credits", type=int)
+        change.add_argument("--reason", default="")
+    public = commands.add_parser("public-purchases")
+    public.add_argument("account")
+    public.add_argument("setting", choices=["on", "off"])
     args = parser.parse_args(argv)
 
     try:
@@ -110,7 +145,22 @@ def main(argv=None) -> None:
                   f"{accounts.limits(args.account)[args.limit]}.")
         elif args.command == "invite":
             print(f"Invite code (works once):  {accounts.create_invite()}")
-    except (accounts.AccountError, identity.IdentityError, ValueError) as e:
+        elif args.command == "balance":
+            show_balance(args.account)
+        elif args.command in ("add-credits", "remove-credits"):
+            if args.credits < 1:
+                raise ValueError("Give a whole number of credits, 1 or more.")
+            sign = 1 if args.command == "add-credits" else -1
+            info = billing.adjust(args.account, sign * args.credits, args.reason)
+            print(f"{'Added' if sign > 0 else 'Removed'} {args.credits} credits. "
+                  f"'{args.account}' now has {info['actions']} actions "
+                  f"({info['credits']} credits).")
+        elif args.command == "public-purchases":
+            billing.set_public_purchases(args.account, args.setting == "on")
+            print(f"Purchase history for '{args.account}' is now "
+                  f"{'public at /purchases/' + args.account if args.setting == 'on' else 'hidden'}.")
+    except (accounts.AccountError, billing.BillingError, identity.IdentityError,
+            ValueError) as e:
         sys.exit(f"Not done: {e}")
 
 
