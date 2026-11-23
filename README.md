@@ -36,6 +36,7 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 |---|---|
 | `save_memory` | Saves a note or decision, with its reason, topic and confidence (low/medium/high) |
 | `find_memory` | Searches memories by question or topic (can also filter by which agent saved them) |
+| `list_memories` | Lists the memories you can read (your own and ones shared with you), newest first; can filter by topic (including everything under it), who saved it and how many (default 20, max 100) |
 | `update_memory` | Replaces a memory's note with new information; the old version is kept in history |
 | `share_memory` | Changes who can read a memory (only the agent that wrote it can do this) |
 | `delete_memory` | Deletes a memory for good, with its history (only the agent that wrote it can do this; agents it's shared with can't) |
