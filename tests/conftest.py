@@ -87,6 +87,16 @@ class FakeCognee:
 
 
 @pytest.fixture(autouse=True)
+def windows_key_lock_stand_in(monkeypatch):
+    """This laptop's own ("local") agents lock their keys with Windows DPAPI, which other
+    systems don't have. So the tests can run on Linux too (e.g. on GitHub), use a simple
+    stand-in there that locks and unlocks the same way. On Windows, the real DPAPI is used."""
+    if sys.platform != "win32":
+        monkeypatch.setattr(identity, "_dpapi",
+                            lambda data, encrypt: bytes(b ^ 0x5A for b in data))
+
+
+@pytest.fixture(autouse=True)
 def clean_settings(monkeypatch):
     """Every test starts with default settings and empty spam-protection counters."""
     for name in ("MEMORIA_SIGNUP", "MEMORIA_TRUST_PROXY", "MEMORIA_DASHBOARD",
@@ -128,6 +138,7 @@ def store(tmp_path, monkeypatch, keys):
     monkeypatch.setattr(memoria, "_write_lock", asyncio.Lock())
     monkeypatch.setattr(memoria, "_cognee_lock", asyncio.Lock())
     monkeypatch.setattr(memoria, "_worker", None)
+    monkeypatch.setattr(memoria, "_last_seen", {})  # "last seen" starts fresh for each test
     # The worker waits between retries; don't make the tests wait.
     real_sleep = asyncio.sleep
     monkeypatch.setattr(asyncio, "sleep", lambda seconds: real_sleep(0))

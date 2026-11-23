@@ -1,0 +1,39 @@
+# Runs Memoria's tests on Linux on every push and pull request (free on GitHub for public
+# repositories). The tests need no secrets: they make their own throwaway keys, use a fake
+# Cognee and a fake chain, and never call Gemini, Resend or Robinhood Chain.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # the same as the live server (Dockerfile)
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install packages
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run the tests
+        # The one test left out starts a whole online server and can hang; it's skipped here
+        # as it is when the tests are run by hand.
+        run: >-
+          python -m pytest -q -p no:logging
+          --deselect "tests/test_online.py::test_memoria_runs_online_with_all_data_in_the_data_folder"
+        env:
+          TELEMETRY_DISABLED: "true"
+          COGNEE_SKIP_CONNECTION_TEST: "true"

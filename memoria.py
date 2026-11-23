@@ -46,6 +46,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
@@ -175,8 +176,21 @@ def check_agent(agent_id: str, account: str = LOCAL) -> str:
             "agent_id must be 2-40 characters: lowercase letters, numbers and dashes "
             "(for example 'claude-code' or 'research-bot')."
         )
-    db.touch_agent(identity.principal(account, agent_id), _now())
+    _touch_agent(identity.principal(account, agent_id))
     return agent_id
+
+
+SEEN_EVERY = 60  # seconds: record "agent last seen" at most this often per agent
+_last_seen: dict[str, float] = {}
+
+
+def _touch_agent(principal: str) -> None:
+    """Remember the agent exists and when it was last seen, but write to the database at
+    most once a minute per agent, not on every request."""
+    now = time.monotonic()
+    if now - _last_seen.get(principal, -SEEN_EVERY) >= SEEN_EVERY:
+        db.touch_agent(principal, _now())
+        _last_seen[principal] = now
 
 
 def _check_confidence(confidence: str) -> str:
@@ -418,17 +432,34 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
             return False
         return True
 
-    found: list[dict] = []
-
     # 1. Ask Cognee for the stored passages closest in meaning to the question.
     #    (If none of this account's memories are in Cognee yet, there's nothing to search.)
-    if db.has_searchable(account):
+    chunks: list[dict] = []
+
+    def before_searching():
+        # Note which memories are still being processed NOW: if one finishes while the
+        # search runs, it's still found by its words (step 2) instead of slipping through.
+        waiting = [mem["id"] for mem in db.visible_memories(account, agent_id, waiting=True,
+                                                            topic=topic, saved_by=saved_by)]
+        return db.has_searchable(account), waiting
+    searchable, waiting_at_start = await asyncio.to_thread(before_searching)
+    if searchable:
         from cognee import SearchType
         results = await _engine().search(
             query, query_type=SearchType.CHUNKS, datasets=[dataset_for(account)],
             top_k=max(50, limit * 10)
         )
         chunks = [c for c in _chunks(results) if _close_enough(c)]
+    # The rest is database work and signature checks: do it in a worker thread, so other
+    # requests aren't held up while it runs.
+    return await asyncio.to_thread(_find_in_database, chunks, wanted, query, agent_id, account,
+                                   topic, saved_by, limit, outcome, waiting_at_start)
+
+
+def _find_in_database(chunks, wanted, query, agent_id, account, topic, saved_by, limit,
+                      outcome, waiting_at_start=()) -> list[dict]:
+    found: list[dict] = []
+    if chunks:
         by_data_id = db.memories_by_data_id(account, [str(c.get("document_id")) for c in chunks])
         for chunk in chunks:
             mem = by_data_id.get(str(chunk.get("document_id")))
@@ -441,8 +472,12 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
     # 2. Memories still being processed aren't in Cognee's search yet (or only in their
     #    old version): find them by the words of the question instead.
     words = _words(query)
-    for mem in db.visible_memories(account, agent_id, waiting=True, topic=topic,
-                                   saved_by=saved_by):
+    waiting = db.visible_memories(account, agent_id, waiting=True, topic=topic,
+                                  saved_by=saved_by)
+    seen = {mem["id"] for mem in waiting}
+    waiting += [mem for mem in (db.get_memory(i) for i in waiting_at_start if i not in seen)
+                if mem]  # finished processing while the search ran
+    for mem in waiting:
         if mem not in found and wanted(mem) \
                 and words & _words(f"{mem['topic']} {mem['note']} {mem['reason']}"):
             found.append(mem)
@@ -485,12 +520,14 @@ async def list_memories(agent_id: str, topic: str | None = None, saved_by: str |
     outcome = _check_outcome_filter(outcome)
     _log(identity.principal(account, agent_id), "list", topic=topic, saved_by=saved_by,
          **({"outcome": outcome} if outcome else {}))
-    found = [m for m in db.visible_memories(account, agent_id, topic_under=topic,
-                                            saved_by=saved_by, limit=limit,
-                                            latest_outcome=outcome)
-             if can_see(m, agent_id, account)]
-    summaries = _summaries(found)
-    return [_with_outcomes(m, summaries[m["id"]]) for m in _ranked(found, summaries)]
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
+        found = [m for m in db.visible_memories(account, agent_id, topic_under=topic,
+                                                saved_by=saved_by, limit=limit,
+                                                latest_outcome=outcome)
+                 if can_see(m, agent_id, account)]
+        summaries = _summaries(found)
+        return [_with_outcomes(m, summaries[m["id"]]) for m in _ranked(found, summaries)]
+    return await asyncio.to_thread(in_database)
 
 
 # ---------- outcomes: did a memory actually help? ----------
@@ -617,12 +654,14 @@ async def get_outcomes(agent_id: str, memory_id: str, account: str = LOCAL) -> d
     """Every outcome recorded for a memory, newest first, each with its signature check."""
     agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
-    _readable(memory_id, agent_id, account, "see the outcomes of")
-    outcomes = db.outcomes_for([memory_id]).get(memory_id, [])
-    summary = _outcome_summary(outcomes)
-    return {"memory_id": memory_id,
-            "summary": {k: v for k, v in summary.items() if not k.startswith("_")},
-            "outcomes": [_outcome_public(o) for o in outcomes]}
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
+        _readable(memory_id, agent_id, account, "see the outcomes of")
+        outcomes = db.outcomes_for([memory_id]).get(memory_id, [])
+        summary = _outcome_summary(outcomes)
+        return {"memory_id": memory_id,
+                "summary": {k: v for k, v in summary.items() if not k.startswith("_")},
+                "outcomes": [_outcome_public(o) for o in outcomes]}
+    return await asyncio.to_thread(in_database)
 
 
 def _max_distance() -> float:

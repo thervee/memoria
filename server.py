@@ -139,7 +139,8 @@ class LoginCheck:
                     "No login pass or API key. Send 'Authorization: Bearer <key>'.")
             credential = auth[7:].strip()
             if credential.startswith(accounts.KEY_PREFIX):
-                account, agent_id = accounts.check_key(credential)
+                # (database work: in a worker thread, so other requests aren't held up)
+                account, agent_id = await asyncio.to_thread(accounts.check_key, credential)
             else:
                 account, agent_id = identity.LOCAL, identity.check_token(credential)
         except (identity.IdentityError, accounts.AccountError) as e:
@@ -150,7 +151,7 @@ class LoginCheck:
 
         # 4. Spam protection: too many requests from this agent, or from its whole account?
         #    Both are checked before either is counted, so a refused request uses up nothing.
-        account_limits = accounts.limits(account)
+        account_limits = await asyncio.to_thread(accounts.limits, account)
         if account_limits:
             who = identity.principal(account, agent_id)
             wait = limits.per_agent.blocked_for(who, account_limits["requests_per_minute"])

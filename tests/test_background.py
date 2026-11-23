@@ -42,10 +42,19 @@ def test_memories_saved_together_are_processed_in_one_run(store):
 def test_unprocessed_memory_is_found_by_its_words(store):
     async def scenario():
         mem = await m.save_memory("alice", "Octopuses have three hearts.", "r", "test/sea")
+        async with m.paused():  # keep it unprocessed while we search (searches still run)
+            found = await m.find_memory("alice", "how many hearts does an octopus have?")
+            assert [x["memory_id"] for x in found] == [mem["memory_id"]]
+            assert found[0]["processing"] is True
+            assert await m.find_memory("alice", "volcanoes") == []
+
+
+def test_a_memory_processed_during_a_search_is_still_found(store):
+    async def scenario():
+        mem = await m.save_memory("alice", "Octopuses have three hearts.", "r", "test/sea")
+        # The background worker may finish processing it while this search runs.
         found = await m.find_memory("alice", "how many hearts does an octopus have?")
         assert [x["memory_id"] for x in found] == [mem["memory_id"]]
-        assert found[0]["processing"] is True
-        assert await m.find_memory("alice", "volcanoes") == []
     run(scenario())
 
 

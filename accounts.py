@@ -130,6 +130,9 @@ def limits(account: str) -> dict | None:
 def create_key(account: str, agent: str) -> str:
     """Make a new API key for one agent of an account. Returns the full key (shown once)."""
     agent = _check_name(agent, "The agent ID")
+    if identity.is_reserved(agent) and identity.public_key_of(
+            identity.principal(account, agent)) is None:  # new agents only
+        raise AccountError(identity.reserved_message(agent))
     _require_account(account)
     most = limits(account)["max_agents"]
     agents = {row["agent"] for row in db.query(
@@ -307,6 +310,8 @@ def start_key_request(account: str, email: str, agent: str) -> tuple[str, str] |
     account = (account or "").strip().lower()
     email = (email or "").strip().lower()
     agent = _check_name(agent, "The agent name")
+    if identity.is_reserved(agent):
+        raise AccountError(identity.reserved_message(agent))
     info = get_account(account)
     if not info or info["status"] != "active" or not email \
             or (info.get("email") or "").strip().lower() != email:

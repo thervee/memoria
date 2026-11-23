@@ -1,4 +1,5 @@
 """Agent keys, login passes and signatures (identity.py)."""
+import sys
 import time
 
 import pytest
@@ -8,6 +9,8 @@ import identity
 
 # ---------- registering ----------
 
+@pytest.mark.skipif(sys.platform != "win32", reason="checks Windows DPAPI encryption, "
+                    "which only exists on Windows")
 def test_register_creates_encrypted_secret_and_public_key(keys):
     secret_file = keys / "alice.key"
     assert secret_file.exists()

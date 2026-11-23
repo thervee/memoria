@@ -82,6 +82,25 @@ def split_principal(name: str) -> tuple[str, str]:
     return (account or LOCAL), agent
 
 
+# Names agents can't take: Memoria uses some itself ("admin" for wallets the host links,
+# "host" for changes the host makes, "memoria" for its own background work), and the
+# others would look official. Agents that already have one keep working; only NEW agents
+# with these names are refused.
+RESERVED_AGENT_NAMES = {"admin", "administrator", "root", "system", "host", "memoria",
+                        "owner", "superuser", "support", "staff", "moderator"}
+
+
+def is_reserved(agent: str) -> bool:
+    """Is this agent name reserved? (Also any name starting with "admin".)"""
+    agent = (agent or "").strip().lower()
+    return agent in RESERVED_AGENT_NAMES or agent.startswith("admin")
+
+
+def reserved_message(agent: str) -> str:
+    return (f"'{agent}' is a reserved name (Memoria uses names like 'admin', 'host' and "
+            "'memoria' itself). Please choose another name for the agent.")
+
+
 def _check_principal(name: str) -> str:
     name = (name or "").strip().lower()
     account, agent = split_principal(name)
@@ -166,10 +185,23 @@ def _dpapi(data: bytes, encrypt: bool) -> bytes:
 
 # ---------- registering agents and loading keys ----------
 
+# The public keys, kept in memory: every signature check needs them, and reading the
+# file each time gets slow as Memoria grows. The file is only read again when it changes
+# (a new agent registered here, or by manage_accounts.py in another process).
+_registry_cache: dict = {"stamp": None, "data": {}}
+
+
 def _registry() -> dict:
-    if REGISTRY.exists():
-        return json.loads(REGISTRY.read_text(encoding="utf-8"))
-    return {}
+    """Every registered agent's public key. Don't change the dict this returns."""
+    try:
+        info = REGISTRY.stat()
+    except FileNotFoundError:
+        return {}
+    stamp = (str(REGISTRY), info.st_mtime_ns, info.st_size)
+    if _registry_cache["stamp"] != stamp:
+        _registry_cache["data"] = json.loads(REGISTRY.read_text(encoding="utf-8"))
+        _registry_cache["stamp"] = stamp
+    return _registry_cache["data"]
 
 
 def public_key_of(agent_id: str) -> str | None:
@@ -181,7 +213,9 @@ def public_key_of(agent_id: str) -> str | None:
 def register_agent(agent_id: str) -> str:
     """Create a key pair for a new agent ("trader" or "acme/trader"). Returns its public key."""
     agent_id = _check_principal(agent_id)
-    registry = _registry()
+    if is_reserved(split_principal(agent_id)[1]):
+        raise IdentityError(reserved_message(split_principal(agent_id)[1]))
+    registry = dict(_registry())  # a copy: the cached one is shared
     key_file = _key_file(agent_id)
     if agent_id in registry or key_file.exists():
         raise IdentityError(f"'{agent_id}' is already registered.")
@@ -202,6 +236,7 @@ def register_agent(agent_id: str) -> str:
     tmp = REGISTRY.with_suffix(".tmp")
     tmp.write_text(json.dumps(registry, indent=2), encoding="utf-8")
     tmp.replace(REGISTRY)
+    _registry_cache["stamp"] = None  # read the new file next time
     return public
 
 
