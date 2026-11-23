@@ -742,3 +742,161 @@ def test_share_has_no_billing_reminder_when_billing_is_off(store, devs, memoria_
         return await mem.share(saved["memory_id"], "shared", ["analyst"])
     shared = run_as(devs["acme/trader"], memoria_url, work)
     assert "billing_note" not in shared and "balance_note" not in shared
+
+
+# ---------- emailing the owner when the balance runs low ----------
+
+@pytest.fixture
+def mailbox(on, monkeypatch):
+    """A fake Resend: emails land in a list (or fail, when told to)."""
+    import signup
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    box = {"sent": [], "fail": False}
+
+    async def send_email(to, subject, text, html):
+        if box["fail"]:
+            raise RuntimeError("pretend Resend is down")
+        box["sent"].append({"to": to, "subject": subject, "text": text})
+    monkeypatch.setattr(signup, "send_email", send_email)
+    return box
+
+
+def set_actions(n, account="acme"):
+    billing.balance(account)  # starter credits added first
+    db.execute("UPDATE billing SET actions = ? WHERE account = ?", (n, account))
+
+
+def spend(times, account="acme"):
+    for _ in range(times):
+        billing.charge(account, "trader", "find_memory")
+
+
+def emails_logged(account="acme"):
+    return [e for e in (m.json.loads(line) for line in m.ACTIVITY_FILE.read_text().splitlines())
+            if e["action"].endswith("_balance_email") and e["agent"].startswith(account + "/")]
+
+
+def test_low_and_empty_emails_go_out_once_each(mailbox):
+    set_actions(6)
+    spend(1)  # 5 left: not low yet
+    assert mailbox["sent"] == []
+    spend(1)  # 4 left: low
+    assert [e["text"] for e in mailbox["sent"]] == [
+        "Your Memoria account acme has 4 actions left. Top up at "
+        "https://www.memoriaagent.site/pay."]
+    assert mailbox["sent"][0]["to"] == "dev@acme.example"
+    assert mailbox["sent"][0]["subject"] == "Your Memoria account is low on actions"
+    spend(3)  # 3, 2, 1 left: no more low emails
+    assert len(mailbox["sent"]) == 1
+    spend(1)  # 0 left: out of actions
+    assert mailbox["sent"][-1]["text"] == (
+        "Your Memoria account acme is out of actions. Your agents can't save or find memories "
+        "until you top up at https://www.memoriaagent.site/pay.")
+    with pytest.raises(billing.BillingError):
+        spend(1)  # refused at 0: no more emails
+    assert len(mailbox["sent"]) == 2
+    assert [e["sent"] for e in emails_logged()] == [True, True]
+
+
+def test_a_payment_resets_the_alerts(mailbox, chain):
+    set_actions(5)
+    spend(5)  # low at 4, empty at 0
+    assert len(mailbox["sent"]) == 2
+    wallet = link()
+    claim(chain.add(tx_hash(80), [transfer(wallet.address, amount=3 * UNIT)]))  # +6 actions
+    spend(2)  # 4 left: a new drop, so a new low email
+    assert len(mailbox["sent"]) == 3 and "4 actions left" in mailbox["sent"][-1]["text"]
+
+
+def test_adding_credits_by_hand_resets_and_removing_them_can_alert(mailbox):
+    set_actions(5)
+    spend(1)  # 4 left: low email
+    manage_accounts.main(["add-credits", "acme", "1"])  # 6 left, alerts reset
+    spend(2)  # 4 left again: low email again
+    assert len(mailbox["sent"]) == 2
+    manage_accounts.main(["remove-credits", "acme", "2"])  # 0 left: out of actions email
+    assert mailbox["sent"][-1]["subject"] == "Your Memoria account is out of actions"
+    assert len(mailbox["sent"]) == 3
+
+
+def test_a_refund_is_not_a_top_up(mailbox):
+    set_actions(5)
+    spend(1)  # 4 left: low email
+    billing.refund("acme", "trader", "find_memory")  # 5 again, but not a top-up
+    spend(1)  # 4 left: no second email
+    assert len(mailbox["sent"]) == 1
+
+
+def test_the_low_email_says_one_action_in_the_singular(on):
+    assert billing.alert_text("acme", "low", 1)[1].startswith(
+        "Your Memoria account acme has 1 action left.")
+
+
+def test_accounts_without_an_email_get_none(mailbox):
+    accounts.create_account("noemail")
+    accounts.create_key("noemail", "bot")
+    set_actions(1, "noemail")
+    spend(1, "noemail")
+    assert mailbox["sent"] == []
+    assert emails_logged("noemail")[-1]["reason"] == "the account has no email"
+
+
+def test_demo_and_local_get_no_emails(mailbox):
+    billing._balance_alerts(demo.ACCOUNT, 0)
+    billing._balance_alerts("local", 0)
+    assert mailbox["sent"] == []
+
+
+def test_without_email_set_up_nothing_is_sent_but_it_is_logged(mailbox, monkeypatch):
+    monkeypatch.delenv("RESEND_API_KEY")
+    set_actions(5)
+    spend(1)
+    assert mailbox["sent"] == []
+    assert emails_logged()[-1]["reason"] == "email isn't set up"
+
+
+def test_a_failed_email_never_breaks_the_tool_call(mailbox, on, memoria_url):
+    mailbox["fail"] = True
+    set_actions(5)
+
+    async def work(mem):
+        saved = await mem.save("Acme renews March 1.", reason="r", topic="customers")  # 4
+        await asyncio.sleep(0.3)  # let the background email try (and fail)
+        return saved
+    saved = run_as(on["acme/trader"], memoria_url, work)
+    assert saved["memory_id"] and actions() == 4
+    logged = emails_logged()
+    assert logged and logged[-1]["sent"] is False and "Resend is down" in logged[-1]["reason"]
+    mailbox["fail"] = False
+    spend(1)  # 3 left: the low alert counted as sent, so no repeat after the failure
+    assert mailbox["sent"] == []
+
+
+def test_the_email_is_sent_from_the_server_without_waiting(mailbox, on, memoria_url):
+    set_actions(5)
+
+    async def work(mem):
+        await mem.find("anything")  # 4 left
+        for _ in range(40):
+            if mailbox["sent"]:
+                break
+            await asyncio.sleep(0.05)
+    run_as(on["acme/trader"], memoria_url, work)
+    assert len(mailbox["sent"]) == 1 and "4 actions left" in mailbox["sent"][0]["text"]
+
+
+def test_older_databases_get_the_alert_flags(keys, tmp_path, monkeypatch):
+    import sqlite3
+    old = tmp_path / "old" / "memoria.db"
+    old.parent.mkdir()
+    conn = sqlite3.connect(old)
+    conn.execute("CREATE TABLE billing (account TEXT PRIMARY KEY, actions INTEGER NOT NULL "
+                 "DEFAULT 0, starter_given INTEGER NOT NULL DEFAULT 0, public_purchases INTEGER "
+                 "NOT NULL DEFAULT 0, updated_at TEXT)")
+    conn.execute("INSERT INTO billing (account, actions) VALUES ('acme', 7)")
+    conn.commit()
+    conn.close()
+    db.close()
+    monkeypatch.setattr(db, "DB_FILE", old)
+    row = db.query("SELECT actions, low_alert_sent, empty_alert_sent FROM billing")[0]
+    assert tuple(row) == (7, 0, 0)

@@ -41,7 +41,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS billing (
     actions          INTEGER NOT NULL DEFAULT 0,   -- 1 credit = MEMORIA_ACTIONS_PER_CREDIT actions
     starter_given    INTEGER NOT NULL DEFAULT 0,   -- 1 once the starter credits were added
     public_purchases INTEGER NOT NULL DEFAULT 0,   -- 1: /purchases/<account> is public
+    low_alert_sent   INTEGER NOT NULL DEFAULT 0,   -- 1 once the "low balance" email went out
+    empty_alert_sent INTEGER NOT NULL DEFAULT 0,   -- 1 once the "out of actions" email went out
     updated_at       TEXT
 );
 CREATE TABLE IF NOT EXISTS wallets (
@@ -209,6 +211,12 @@ def connection() -> sqlite3.Connection:
             # Version 2 added memories.source; older databases get the column, empty.
             if "source" not in {row[1] for row in conn.execute("PRAGMA table_info(memories)")}:
                 conn.execute("ALTER TABLE memories ADD COLUMN source TEXT")
+            # Version 5 added the balance alert flags; older databases get them, unset.
+            billing_columns = {row[1] for row in conn.execute("PRAGMA table_info(billing)")}
+            for column in ("low_alert_sent", "empty_alert_sent"):
+                if column not in billing_columns:
+                    conn.execute(f"ALTER TABLE billing ADD COLUMN {column} INTEGER NOT NULL "
+                                 "DEFAULT 0")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)

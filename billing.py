@@ -11,6 +11,11 @@ How it works:
     laptop) and the public demo account are never charged.
   - When an account has LOW_BALANCE actions or fewer left, every tool's result carries a
     short "balance_note" saying so, with the pay page link.
+  - The account's owner is also emailed (through Resend, like sign-up emails) once when the
+    balance drops to LOW_BALANCE or fewer, and once more when it reaches 0. Adding credits
+    resets this, so the next drop is emailed again. Accounts without an email, and the
+    local and demo accounts, are never emailed. A failed email is logged and never stops
+    the tool call.
   - New accounts get MEMORIA_STARTER_CREDITS credits (default 10) once. Accounts that
     existed before billing was turned on get them once, the first time billing is on.
   - To pay, an account links a wallet (wallet_challenge, then link_wallet with the
@@ -203,7 +208,87 @@ def charge(account: str, agent: str, action: str) -> bool:
     if not taken:
         raise BillingError(out_of_actions(left))
     _log(account, agent, "charge", tool=action, actions_left=left)
+    _balance_alerts(account, left)
     return True
+
+
+# ---------- emailing the owner when the balance runs low ----------
+
+_alert_tasks: set = set()  # keep running email tasks alive until they finish
+
+
+def _balance_alerts(account: str, left: int) -> None:
+    """Email the owner once when the balance drops to LOW_BALANCE or fewer actions, and
+    once more at 0. The flags are set before sending, so a failure never causes repeats."""
+    if account in NEVER_CHARGED or left > LOW_BALANCE:
+        return
+    kind = "empty" if left <= 0 else "low"
+    with db.transaction() as conn:
+        if kind == "empty":  # (also counts as the low alert, if that was skipped)
+            first = conn.execute("UPDATE billing SET empty_alert_sent = 1, low_alert_sent = 1 "
+                                 "WHERE account = ? AND empty_alert_sent = 0",
+                                 (account,)).rowcount
+        else:
+            first = conn.execute("UPDATE billing SET low_alert_sent = 1 "
+                                 "WHERE account = ? AND low_alert_sent = 0", (account,)).rowcount
+    if first:
+        _in_background(_send_alert(account, kind, max(left, 0)))
+
+
+def _reset_alerts(conn, account: str) -> None:
+    """Credits were added: the next drop is emailed again."""
+    conn.execute("UPDATE billing SET low_alert_sent = 0, empty_alert_sent = 0 "
+                 "WHERE account = ?", (account,))
+
+
+def _in_background(work) -> None:
+    """Run an email without making anyone wait for it."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # e.g. manage_accounts.py: nothing else is waiting, so just send
+        try:
+            asyncio.run(work)
+        except Exception as e:
+            print(f"Memoria billing: balance email failed: {e}", file=sys.stderr, flush=True)
+        return
+    task = loop.create_task(work)
+    _alert_tasks.add(task)
+    task.add_done_callback(_alert_tasks.discard)
+
+
+def alert_text(account: str, kind: str, left: int) -> tuple[str, str]:
+    """The subject and text of a balance email."""
+    if kind == "empty":
+        return ("Your Memoria account is out of actions",
+                f"Your Memoria account {account} is out of actions. Your agents can't save or "
+                f"find memories until you top up at {pay_page()}.")
+    return ("Your Memoria account is low on actions",
+            f"Your Memoria account {account} has {left} action{'' if left == 1 else 's'} "
+            f"left. Top up at {pay_page()}.")
+
+
+async def _send_alert(account: str, kind: str, left: int) -> None:
+    action = f"{kind}_balance_email"
+    try:
+        email = ((accounts.get_account(account) or {}).get("email") or "").strip()
+        if not email:
+            _log(account, "memoria", action, sent=False, reason="the account has no email")
+            return
+        if not signup._setting("RESEND_API_KEY"):
+            _log(account, "memoria", action, sent=False, reason="email isn't set up")
+            return
+        subject, text = alert_text(account, kind, left)
+        link = '<a href="' + pay_page() + '">' + pay_page() + '</a>'
+        html = "<p>" + text.replace(pay_page(), link) + "</p>"
+        await signup.send_email(email, subject, text, html)
+        _log(account, "memoria", action, sent=True, actions_left=left)
+    except Exception as e:  # never let an email problem reach the tool call
+        print(f"Memoria billing: {kind} balance email to '{account}' not sent: {e}",
+              file=sys.stderr, flush=True)
+        try:
+            _log(account, "memoria", action, sent=False, reason=str(e)[:200])
+        except Exception:
+            pass
 
 
 def refund(account: str, agent: str, action: str) -> None:
@@ -265,9 +350,14 @@ def adjust(account: str, credits: int, reason: str = "") -> dict:
                                f"{-delta} can't be removed.")
         conn.execute("UPDATE billing SET actions = actions + ?, updated_at = ? "
                      "WHERE account = ?", (delta, _now(), account))
+        if delta > 0:
+            _reset_alerts(conn, account)
+        left = row["actions"] + delta
     _log_starter(account, "host", added)
     _log(account, "host", "credits_adjusted", credits=int(credits), actions=delta,
          reason=reason)
+    if delta < 0:
+        _balance_alerts(account, left)
     return balance(account, "host")
 
 
@@ -529,6 +619,7 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
             _, added = _ensure(conn, account)
             conn.execute("UPDATE billing SET actions = actions + ?, updated_at = ? "
                          "WHERE account = ?", (actions, now, account))
+            _reset_alerts(conn, account)
     except sqlite3.IntegrityError:  # claimed by another request at the same moment
         raise BillingError("This payment was already claimed.") from None
     _log_starter(account, agent, added)
