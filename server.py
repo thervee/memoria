@@ -101,6 +101,32 @@ def _capped(receive, most: int):
     return wrapped
 
 
+def _proxy_check(scope, ip: str) -> None:
+    """TEMPORARY diagnostic for the website proxy (middleware.js): for requests that came
+    through Vercel or carry its headers, print whether the headers arrived and whether the
+    secret matches. Only true/false and lengths, never any values. Remove once confirmed."""
+    import hmac
+    import os
+    headers = {k.lower(): v for k, v in scope.get("headers", [])}
+    sent = headers.get(limits.PROXY_SECRET_HEADER, b"").decode(errors="replace").strip()
+    mine = os.environ.get("MEMORIA_PROXY_SECRET", "").strip()
+    via_vercel = b"x-vercel-id" in headers or b"x-vercel-forwarded-for" in headers
+    if not (sent or via_vercel or limits.CLIENT_IP_HEADER in headers):
+        return
+    print("memoria-proxy-check " + json.dumps({
+        "path": scope.get("path"),
+        "viaVercel": via_vercel,
+        "secretHeaderArrived": bool(sent),
+        "secretHeaderLength": len(sent),
+        "serverSecretSet": bool(mine),
+        "serverSecretLength": len(mine),
+        "secretMatches": bool(sent and mine and hmac.compare_digest(sent, mine)),
+        "clientIpHeaderArrived": limits.CLIENT_IP_HEADER in headers,
+        "usedVisitorAddress": ip == headers.get(limits.CLIENT_IP_HEADER, b"").decode(
+            errors="replace").strip(),
+    }), file=sys.stderr, flush=True)
+
+
 class LoginCheck:
     """Checks every request before it reaches Memoria: limits first, then the login."""
 
@@ -111,6 +137,7 @@ class LoginCheck:
         if scope["type"] != "http":  # start-up / shut-down messages pass straight through
             return await self.app(scope, receive, send)
         ip = limits.client_ip(scope)
+        _proxy_check(scope, ip)  # TEMPORARY diagnostic, see below
 
         # 1. Spam protection: too many requests from this address?
         if not limits.is_this_computer(ip):
