@@ -58,7 +58,7 @@ def test_claimed_identity_without_pass_is_still_refused(keys):
     assert seen is None and status(sent) == 401
 
 
-def test_all_six_tools_are_offered():
+def test_all_eight_tools_are_offered():
     names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
     assert names == {"save_memory", "find_memory", "list_memories", "update_memory",
-                     "share_memory", "delete_memory"}
+                     "share_memory", "delete_memory", "record_outcome", "get_outcomes"}

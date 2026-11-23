@@ -395,8 +395,9 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
 
 async def find_memory(agent_id: str, query: str, topic: str | None = None,
                       saved_by: str | None = None, limit: int = 5,
-                      account: str = LOCAL) -> list[dict]:
+                      account: str = LOCAL, outcome: str | None = None) -> list[dict]:
     agent_id = check_agent(agent_id, account)
+    outcome = _check_outcome_filter(outcome)
     query = _require(query, "query")
     limit = max(1, min(int(limit or 5), 20))
     _log(identity.principal(account, agent_id), "find", query=query, topic=topic, saved_by=saved_by)
@@ -447,14 +448,19 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
             if mem not in found and wanted(mem):
                 found.append(mem)
 
-    return [_public(m) for m in found[:limit]]
+    summaries = _summaries(found)
+    if outcome:
+        found = [m for m in found if _latest_result(summaries[m["id"]]) == outcome]
+    found = _ranked(found, summaries)
+    return [_with_outcomes(m, summaries[m["id"]]) for m in found[:limit]]
 
 
 LIST_DEFAULT, LIST_MAX = 20, 100
 
 
 async def list_memories(agent_id: str, topic: str | None = None, saved_by: str | None = None,
-                        limit: int = LIST_DEFAULT, account: str = LOCAL) -> list[dict]:
+                        limit: int = LIST_DEFAULT, account: str = LOCAL,
+                        outcome: str | None = None) -> list[dict]:
     """The memories this agent may read (its own, plus ones shared with it), newest first.
 
     topic matches that topic and everything under it ("customers/" or "customers" also
@@ -468,10 +474,147 @@ async def list_memories(agent_id: str, topic: str | None = None, saved_by: str |
         limit = max(1, min(int(LIST_DEFAULT if limit is None else limit), LIST_MAX))
     except (TypeError, ValueError):
         raise MemoriaError(f"limit must be a number from 1 to {LIST_MAX}.") from None
-    _log(identity.principal(account, agent_id), "list", topic=topic, saved_by=saved_by)
-    found = db.visible_memories(account, agent_id, topic_under=topic, saved_by=saved_by,
-                                limit=limit)
-    return [_public(m) for m in found if can_see(m, agent_id, account)]
+    outcome = _check_outcome_filter(outcome)
+    _log(identity.principal(account, agent_id), "list", topic=topic, saved_by=saved_by,
+         **({"outcome": outcome} if outcome else {}))
+    found = [m for m in db.visible_memories(account, agent_id, topic_under=topic,
+                                            saved_by=saved_by, limit=limit,
+                                            latest_outcome=outcome)
+             if can_see(m, agent_id, account)]
+    summaries = _summaries(found)
+    return [_with_outcomes(m, summaries[m["id"]]) for m in _ranked(found, summaries)]
+
+
+# ---------- outcomes: did a memory actually help? ----------
+
+OUTCOME_RESULTS = ("success", "failure", "mixed")
+OUTCOME_FILTERS = OUTCOME_RESULTS + ("none",)
+MAX_OUTCOME_NOTE = 500
+# Ranking: each net success (successes minus failures) moves a memory up one place, each
+# net failure down one place, at most 2 places either way; on a tie the memory with the
+# better record goes first. Relevance still decides the order otherwise, and memories with
+# no outcomes don't move. Only outcomes whose signatures check out count.
+OUTCOME_STEP, OUTCOME_MAX_SHIFT = 1, 2
+
+
+def _outcome_content(outcome: dict) -> bytes:
+    """The exact bytes that get signed for an outcome."""
+    content = {f: outcome.get(f) for f in ("memory_id", "account", "agent_id", "result",
+                                           "note", "recorded_at")}
+    return ("memoria-outcome-v1|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
+                                               separators=(",", ":"))).encode("utf-8")
+
+
+def _outcome_verified(outcome: dict) -> tuple[bool, str]:
+    signer = identity.principal(outcome["account"], outcome["agent_id"])
+    return identity.verify(_outcome_content(outcome), outcome.get("signature"), signer)
+
+
+def _outcome_public(outcome: dict) -> dict:
+    ok, detail = _outcome_verified(outcome)
+    return {"result": outcome["result"], "note": outcome["note"], "agent": outcome["agent_id"],
+            "recorded_at": outcome["recorded_at"],
+            "verification": "verified" if ok else "NOT verified",
+            "verification_detail": detail}
+
+
+def _outcome_summary(outcomes: list[dict]) -> dict:
+    """Counts by result, the latest outcome and whether every signature checked out."""
+    shown = [_outcome_public(o) for o in outcomes]  # newest first
+    counts = {r: sum(1 for o in shown if o["result"] == r) for r in OUTCOME_RESULTS}
+    verified = {r: sum(1 for o in shown if o["result"] == r and o["verification"] == "verified")
+                for r in OUTCOME_RESULTS}
+    not_verified = sum(1 for o in shown if o["verification"] != "verified")
+    return {**counts, "total": len(shown), "latest": shown[0] if shown else None,
+            "signatures": ("none" if not shown else "all verified" if not not_verified
+                           else f"{not_verified} NOT verified"),
+            "_verified": verified}
+
+
+def _summaries(memories: list[dict]) -> dict[str, dict]:
+    by_memory = db.outcomes_for([m["id"] for m in memories])
+    return {m["id"]: _outcome_summary(by_memory.get(m["id"], [])) for m in memories}
+
+
+def _latest_result(summary: dict) -> str:
+    return summary["latest"]["result"] if summary["latest"] else "none"
+
+
+def _check_outcome_filter(outcome: str | None) -> str | None:
+    outcome = (outcome or "").strip().lower() or None
+    if outcome and outcome not in OUTCOME_FILTERS:
+        raise MemoriaError("outcome must be 'success', 'failure', 'mixed' or 'none'.")
+    return outcome
+
+
+def _ranked(memories: list[dict], summaries: dict[str, dict]) -> list[dict]:
+    """Nudge memories that helped up and ones that failed down, a little."""
+    def key(item):
+        place, mem = item
+        good = summaries[mem["id"]]["_verified"]
+        net = good["success"] - good["failure"]
+        shift = max(-OUTCOME_MAX_SHIFT, min(OUTCOME_MAX_SHIFT, OUTCOME_STEP * net))
+        return (place - shift, -net, place)
+    return [mem for _, mem in sorted(enumerate(memories), key=key)]
+
+
+def _with_outcomes(mem: dict, summary: dict) -> dict:
+    out = _public(mem)
+    out["outcomes"] = {k: v for k, v in summary.items() if not k.startswith("_")}
+    return out
+
+
+def _readable(memory_id: str, agent_id: str, account: str, what: str) -> dict:
+    """The memory, if this agent may read it. Never says whether a memory exists."""
+    mem = db.get_memory(memory_id)
+    if mem is None or not can_see(mem, agent_id, account):
+        raise MemoriaError(f"You're not allowed to {what} memory '{memory_id}'.")
+    return mem
+
+
+async def record_outcome(agent_id: str, memory_id: str, result: str, note: str = "",
+                         account: str = LOCAL) -> dict:
+    """Record whether a memory helped. One outcome per agent per memory: recording again
+    replaces this agent's earlier one. Any agent that may read the memory can do this."""
+    agent_id = check_agent(agent_id, account)
+    who = identity.principal(account, agent_id)
+    memory_id = _require(memory_id, "memory_id")
+    result = (result or "").strip().lower()
+    if result not in OUTCOME_RESULTS:
+        raise MemoriaError("result must be 'success', 'failure' or 'mixed'.")
+    note = (note or "").strip()
+    if len(note) > MAX_OUTCOME_NOTE:
+        raise MemoriaError(f"note can be {MAX_OUTCOME_NOTE} characters at most.")
+    async with _write_lock:
+        _readable(memory_id, agent_id, account, "record an outcome for")
+        previous = db.get_outcome(memory_id, agent_id)
+        outcome = {"memory_id": memory_id, "account": account, "agent_id": agent_id,
+                   "result": result, "note": note, "recorded_at": _now()}
+        try:
+            sig = identity.sign(who, _outcome_content(outcome))
+        except identity.IdentityError as e:
+            raise MemoriaError(str(e)) from e
+        sig["signed_at"] = _now()
+        outcome["signature"] = sig
+        db.put_outcome(outcome)
+    _log(who, "outcome", memory_id=memory_id, result=result,
+         **({"replaced": previous["result"]} if previous else {}))
+    summary = _outcome_summary(db.outcomes_for([memory_id]).get(memory_id, []))
+    return {"memory_id": memory_id, "recorded": _outcome_public(outcome),
+            "replaced": previous["result"] if previous else None,
+            "outcomes": {k: v for k, v in summary.items() if not k.startswith("_")}}
+
+
+async def get_outcomes(agent_id: str, memory_id: str, account: str = LOCAL) -> dict:
+    """Every outcome recorded for a memory, newest first, each with its signature check."""
+    agent_id = check_agent(agent_id, account)
+    memory_id = _require(memory_id, "memory_id")
+    _readable(memory_id, agent_id, account, "see the outcomes of")
+    outcomes = db.outcomes_for([memory_id]).get(memory_id, [])
+    summary = _outcome_summary(outcomes)
+    return {"memory_id": memory_id,
+            "summary": {k: v for k, v in summary.items() if not k.startswith("_")},
+            "outcomes": [_outcome_public(o) for o in outcomes]}
 
 
 def _chunks(results) -> list[dict]:

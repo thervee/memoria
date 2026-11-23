@@ -19,6 +19,7 @@ What's in it:
   wallets       wallets linked to an account, to pay with $MEMORIA
   wallet_challenges  one-time messages a wallet signs to prove it belongs to an account
   payments      $MEMORIA payments already claimed (each transfer can be claimed only once)
+  outcomes      whether a memory helped: one signed result per agent per memory
 
 The activity log stays a plain text file (activity.log), easy to read and search.
 
@@ -40,7 +41,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -166,6 +167,16 @@ CREATE TABLE IF NOT EXISTS payments (
     PRIMARY KEY (tx_hash, log_index)              -- so a payment can never be claimed twice
 );
 CREATE INDEX IF NOT EXISTS payments_by_account ON payments(account);
+CREATE TABLE IF NOT EXISTS outcomes (
+    memory_id   TEXT NOT NULL,
+    account     TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,                     -- the agent that recorded it
+    result      TEXT NOT NULL,                     -- success, failure or mixed
+    note        TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT NOT NULL,
+    signature   TEXT,                              -- JSON, like memories' signatures
+    PRIMARY KEY (memory_id, agent_id)              -- one outcome per agent per memory
+);
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
@@ -305,7 +316,52 @@ def get_memory(memory_id: str) -> dict | None:
 
 
 def remove_memory(memory_id: str) -> None:
+    """Delete a memory and its outcomes (callers wrap this in a transaction)."""
+    execute("DELETE FROM outcomes WHERE memory_id = ?", (memory_id,))
     execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+
+# ---------- outcomes: did a memory help? ----------
+
+_OUTCOME_FIELDS = ("memory_id", "account", "agent_id", "result", "note", "recorded_at",
+                   "signature")
+# The latest outcome of a memory: newest first, then by agent ID so ties are stable.
+LATEST_OUTCOME = ("(SELECT o.result FROM outcomes o WHERE o.memory_id = memories.id "
+                  "ORDER BY o.recorded_at DESC, o.agent_id LIMIT 1)")
+
+
+def _to_outcome(row) -> dict:
+    out = {f: row[f] for f in _OUTCOME_FIELDS}
+    out["signature"] = json.loads(out["signature"]) if out["signature"] else None
+    return out
+
+
+def put_outcome(outcome: dict) -> None:
+    """Save an agent's outcome for a memory, replacing its earlier one."""
+    values = [outcome.get(f) for f in _OUTCOME_FIELDS]
+    values[-1] = json.dumps(outcome.get("signature"), ensure_ascii=False)
+    execute(f"INSERT INTO outcomes ({', '.join(_OUTCOME_FIELDS)}) VALUES "
+            f"({', '.join('?' for _ in _OUTCOME_FIELDS)}) ON CONFLICT(memory_id, agent_id) DO "
+            "UPDATE SET " + ", ".join(f"{f} = excluded.{f}" for f in _OUTCOME_FIELDS[1:]), values)
+
+
+def get_outcome(memory_id: str, agent_id: str) -> dict | None:
+    rows = query("SELECT * FROM outcomes WHERE memory_id = ? AND agent_id = ?",
+                 (memory_id, agent_id))
+    return _to_outcome(rows[0]) if rows else None
+
+
+def outcomes_for(memory_ids: list[str]) -> dict[str, list[dict]]:
+    """Every outcome of these memories, newest first, by memory ID."""
+    found: dict[str, list[dict]] = {}
+    ids = list(dict.fromkeys(memory_ids))
+    for start in range(0, len(ids), 500):  # SQLite allows only so many ? at once
+        part = ids[start:start + 500]
+        for row in query(f"SELECT * FROM outcomes WHERE memory_id IN "
+                         f"({', '.join('?' for _ in part)}) ORDER BY recorded_at DESC, agent_id",
+                         part):
+            found.setdefault(row["memory_id"], []).append(_to_outcome(row))
+    return found
 
 
 def count_memories(account: str) -> int:
@@ -332,7 +388,8 @@ def memories_by_data_id(account: str, data_ids: list[str]) -> dict[str, dict]:
 
 def visible_memories(account: str, agent_id: str, *, waiting: bool = False,
                      topic: str | None = None, saved_by: str | None = None,
-                     limit: int | None = None, topic_under: str | None = None) -> list[dict]:
+                     limit: int | None = None, topic_under: str | None = None,
+                     latest_outcome: str | None = None) -> list[dict]:
     """Memories this agent may read (its own, plus ones shared with it), newest first.
 
     topic: topics containing this text. topic_under: this topic and everything under it
@@ -353,6 +410,11 @@ def visible_memories(account: str, agent_id: str, *, waiting: bool = False,
     if saved_by:
         sql.append("AND agent_id = ?")
         params.append(saved_by.strip().lower())
+    if latest_outcome == "none":
+        sql.append("AND NOT EXISTS (SELECT 1 FROM outcomes o WHERE o.memory_id = memories.id)")
+    elif latest_outcome:
+        sql.append(f"AND {LATEST_OUTCOME} = ?")
+        params.append(latest_outcome)
     sql.append("ORDER BY coalesce(updated_at, created_at) DESC, id")
     if limit:
         sql.append("LIMIT ?")

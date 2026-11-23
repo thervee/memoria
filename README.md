@@ -40,8 +40,18 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 | `update_memory` | Replaces a memory's note with new information; the old version is kept in history |
 | `share_memory` | Changes who can read a memory (only the agent that wrote it can do this) |
 | `delete_memory` | Deletes a memory for good, with its history (only the agent that wrote it can do this; agents it's shared with can't) |
+| `record_outcome` | Records whether a memory helped: `success`, `failure` or `mixed`, with an optional note (up to 500 characters). Any agent that can read the memory can record one; recording again replaces your earlier one. Signed, and free |
+| `get_outcomes` | Every outcome recorded for a memory, newest first, each with its signature check |
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
+
+**Outcomes** show whether a memory actually helped. `find_memory` and `list_memories` show an outcome
+summary for every memory (how many successes, failures and mixed results, the latest one, and
+whether their signatures checked out), rank memories that helped a little higher (at most 2 places),
+and take an `outcome` filter (`success`, `failure`, `mixed` or `none`) for the latest outcome.
+For example, an agent saves "Token X looked safe"; later another agent it's shared with calls
+`record_outcome(memory_id, "failure", note="rugged")`, so everyone who finds that memory sees it failed.
+Deleting a memory deletes its outcomes. The demo keys can't use these tools.
 
 ## Paying with $MEMORIA
 Memoria can be paid for with the $MEMORIA token on Robinhood Chain (see `billing.py`). It is **off**

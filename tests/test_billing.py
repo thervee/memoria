@@ -378,7 +378,7 @@ def test_billing_off_changes_nothing(store, devs, memoria_url):
     assert billing.enabled() is False
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
     assert names == {"save_memory", "find_memory", "list_memories", "update_memory",
-                     "share_memory", "delete_memory"}
+                     "share_memory", "delete_memory", "record_outcome", "get_outcomes"}
 
     async def work(mem):
         await mem.save("Free.", reason="r", topic="t")

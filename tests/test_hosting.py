@@ -650,7 +650,7 @@ def test_bridge_works_with_an_api_key(memoria_url, devs):
                                                          api_key=devs["globex/analyst"])
 
     async def scenario():
-        assert len((await list_tools(None, None)).tools) == 6
+        assert len((await list_tools(None, None)).tools) == 8
         result = await call_tool(None, types.CallToolRequestParams(
             name="save_memory", arguments={"note": "Owls hunt.", "reason": "r", "topic": "t"}))
         assert not result.is_error and '"account":"globex"' in result.content[0].text.replace(" ", "")

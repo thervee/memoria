@@ -243,44 +243,85 @@ async def save_memory(note: str, reason: str, topic: str, ctx: Context,
 
 @mcp.tool()
 async def find_memory(query: str, ctx: Context, topic: str | None = None,
-                      saved_by: str | None = None, limit: int = 5) -> list[dict]:
+                      saved_by: str | None = None, limit: int = 5,
+                      outcome: str | None = None) -> list[dict]:
     """Search past memories by topic or question. Best matches come first.
 
     Only returns memories you are allowed to read: your own, plus ones shared with you.
     Each memory comes with its signature check ("verified" or "NOT verified") and its
     "source": where the claim came from, or "no source" if none was given, in which
-    case the claim can't be checked.
+    case the claim can't be checked. Each also has an "outcomes" summary: how often it
+    helped (success / failure / mixed), the latest outcome and whether the outcomes'
+    signatures checked out. Memories that helped rank a little higher.
 
     Args:
         query: A question or keywords, e.g. "What do we know about Chainlink's token?"
         topic: Optional: only return memories whose topic contains this text.
         saved_by: Optional: only return memories saved by this agent ID.
         limit: How many memories to return (1-20).
+        outcome: Optional: only memories whose latest outcome is "success", "failure",
+            "mixed", or "none" (no outcome recorded yet).
     """
     agent_id, account = _agent(ctx)
     return await _charged(account, agent_id, "find_memory", lambda: memoria.find_memory(
-        agent_id, query, topic, saved_by, limit, account=account))
+        agent_id, query, topic, saved_by, limit, account=account, outcome=outcome))
 
 
 @mcp.tool()
 async def list_memories(ctx: Context, topic: str | None = None, saved_by: str | None = None,
-                        limit: int = 20) -> list[dict]:
+                        limit: int = 20, outcome: str | None = None) -> list[dict]:
     """List the memories you are allowed to read, newest first (no search question needed).
 
     Only lists your own memories plus ones shared with you. Each memory comes with its
-    signature check ("verified" or "NOT verified") and its source, like find_memory.
+    signature check ("verified" or "NOT verified"), its source and its outcomes summary,
+    like find_memory.
 
     Args:
         topic: Optional: only this topic and everything under it, e.g. "customers" or
             "customers/" also lists "customers/acme".
         saved_by: Optional: only memories saved by this agent ID.
         limit: How many memories to return (1-100, default 20).
+        outcome: Optional: only memories whose latest outcome is "success", "failure",
+            "mixed", or "none" (no outcome recorded yet).
     """
     agent_id, account = _agent(ctx)
     if demo.is_read_only(account):  # the public demo keys may only use find_memory
         raise ToolError("The demo key can only use find_memory.")
     return await _charged(account, agent_id, "list_memories", lambda: memoria.list_memories(
-        agent_id, topic, saved_by, limit, account=account))
+        agent_id, topic, saved_by, limit, account=account, outcome=outcome))
+
+
+@mcp.tool()
+async def record_outcome(memory_id: str, result: str, ctx: Context, note: str = "") -> dict:
+    """Record whether a memory actually helped, so other agents can trust it (or not).
+
+    You can do this for any memory you can read: your own or one shared with you. You have
+    one outcome per memory: recording again replaces your earlier one. Outcomes are signed
+    by you, like memories. Free: it uses no billing actions.
+
+    Args:
+        memory_id: The memory's ID, from find_memory or list_memories.
+        result: "success" (it helped), "failure" (it was wrong or didn't help) or "mixed".
+        note: Optional: what happened, up to 500 characters, e.g. "rugged".
+    """
+    agent_id, account = _writer(ctx)
+    return await _run(memoria.record_outcome(agent_id, memory_id, result, note,
+                                             account=account))
+
+
+@mcp.tool()
+async def get_outcomes(memory_id: str, ctx: Context) -> dict:
+    """Every outcome recorded for a memory, newest first, each with its signature check.
+
+    Only for memories you can read: your own or ones shared with you.
+
+    Args:
+        memory_id: The memory's ID, from find_memory or list_memories.
+    """
+    agent_id, account = _agent(ctx)
+    if demo.is_read_only(account):  # the public demo keys may only use find_memory
+        raise ToolError("The demo key can only use find_memory.")
+    return await _run(memoria.get_outcomes(agent_id, memory_id, account=account))
 
 
 @mcp.tool()

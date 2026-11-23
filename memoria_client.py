@@ -151,12 +151,19 @@ class Memoria:
                                 confidence=confidence, visibility=visibility,
                                 shared_with=shared_with)
 
-    async def find(self, query, topic=None, saved_by=None, limit=5) -> list[dict]:
+    async def find(self, query, topic=None, saved_by=None, limit=5, outcome=None) -> list[dict]:
         return await self._call("find_memory", query=query, topic=topic, saved_by=saved_by,
-                                limit=limit)
+                                limit=limit, outcome=outcome)
 
-    async def list(self, topic=None, saved_by=None, limit=20) -> list[dict]:
-        return await self._call("list_memories", topic=topic, saved_by=saved_by, limit=limit)
+    async def list(self, topic=None, saved_by=None, limit=20, outcome=None) -> list[dict]:
+        return await self._call("list_memories", topic=topic, saved_by=saved_by, limit=limit,
+                                outcome=outcome)
+
+    async def record_outcome(self, memory_id, result, note="") -> dict:
+        return await self._call("record_outcome", memory_id=memory_id, result=result, note=note)
+
+    async def outcomes(self, memory_id) -> dict:
+        return await self._call("get_outcomes", memory_id=memory_id)
 
     # Paying with $MEMORIA (only when the host has turned billing on)
     async def wallet_challenge(self) -> dict:
