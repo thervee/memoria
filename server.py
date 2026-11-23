@@ -122,7 +122,8 @@ class LoginCheck:
                 return await _too_many(send, wait, "Too many wrong API keys from your address.")
 
         # 2. Throw away any identity the request claims for itself.
-        drop = {AGENT_HEADER.encode(), ACCOUNT_HEADER.encode()}
+        drop = {AGENT_HEADER.encode(), ACCOUNT_HEADER.encode(), limits.PROXY_SECRET_HEADER,
+                limits.CLIENT_IP_HEADER}  # (the website's proxy secret goes no further)
         headers = [(k, v) for k, v in scope["headers"] if k.lower() not in drop]
         found = dict(headers)
         length = found.get(b"content-length", b"0")

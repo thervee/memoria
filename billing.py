@@ -39,6 +39,12 @@ Settings (environment variables, e.g. Railway Variables):
   MEMORIA_ACTIONS_PER_CREDIT 2
   MEMORIA_STARTER_CREDITS    10
   MEMORIA_MIN_CONFIRMATIONS  20
+  MEMORIA_CLAIM_START_BLOCK  transfers in earlier blocks can't be claimed (default: the block
+                             of the first payment, 121276863), so older transfers to the treasury
+                             (team, airdrop or liquidity moves) never become credits
+Payments count in whole credits; what's left over is kept per account and added to its
+next payment. The host can link a wallet by hand only after it sends a small, exact test
+amount to the treasury (admin_proof_request, then admin_prove_and_link).
 
 This file also serves the pay page's HTTP endpoints (see app() at the end) and the public
 purchase history at /purchases/<account>.
@@ -68,6 +74,10 @@ TREASURY_ADDRESS = "0x7d61Bd6D005B464C9022e1b2FAdD0F16C93E935C"
 CHAIN_ID = 4663
 PUBLIC_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
 EXPLORER_URL = "https://robinhoodchain.blockscout.com"
+# The Robinhood Chain block of Memoria's first $MEMORIA payment (23 Nov 2026). Transfers
+# to the treasury before it (team, airdrop or liquidity moves) can never be claimed as
+# credits. Change with MEMORIA_CLAIM_START_BLOCK.
+CLAIM_START_BLOCK = 121_276_863
 DECIMALS = 18
 # keccak256("Transfer(address,address,uint256)"): the ERC-20 Transfer event
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -110,6 +120,7 @@ def settings() -> dict:
         "actions_per_credit": _number("MEMORIA_ACTIONS_PER_CREDIT", 2),
         "starter_credits": _number("MEMORIA_STARTER_CREDITS", 10, least=0),
         "min_confirmations": _number("MEMORIA_MIN_CONFIRMATIONS", 20),
+        "claim_start_block": _number("MEMORIA_CLAIM_START_BLOCK", CLAIM_START_BLOCK, least=0),
     }
 
 
@@ -335,6 +346,7 @@ def balance(account: str, agent: str = "") -> dict:
         "pay_page": pay_page(),
         "treasury": s["treasury"],
         "costs": {"1 action each": list(CHARGED_ACTIONS), "free": list(FREE_ACTIONS)},
+        "leftover_tokens": _tokens(int(row["leftover"] or 0)),
     }
 
 
@@ -471,32 +483,6 @@ def link_wallet(account: str, agent: str, address: str, signature: str) -> dict:
 ADMIN_AGENT = "admin"  # the agent recorded for wallets the host links by hand
 
 
-def admin_link_wallet(account: str, address: str) -> dict:
-    """The host links a wallet to an account by hand, without a signature (for agents
-    whose wallets can't sign messages). Same rules as link_wallet: a valid address, and
-    a wallet can belong to only one account."""
-    address = (address or "").strip()
-    if accounts.get_account(account) is None:
-        raise BillingError(f"No account called '{account}'.")
-    if not ADDRESS.match(address):
-        raise BillingError("That isn't a wallet address (0x and 40 hex characters).")
-    now = _now()
-    with db.transaction() as conn:
-        owner = conn.execute("SELECT account FROM wallets WHERE address = ?",
-                             (address.lower(),)).fetchone()
-        if owner and owner["account"] != account:
-            raise BillingError("That wallet is already linked to another Memoria account. "
-                               "A wallet can belong to only one account.")
-        if owner is None:
-            conn.execute("INSERT INTO wallets (address, account, agent, linked_at) "
-                         "VALUES (?, ?, ?, ?)", (address.lower(), account, ADMIN_AGENT, now))
-    if owner is None:
-        _log(account, ADMIN_AGENT, "link_wallet", wallet=address.lower(), by="host",
-             linked_at=now)
-    return {"linked": address.lower(), "already_linked": owner is not None,
-            "wallets": wallets_of(account)}
-
-
 def admin_unlink_wallet(account: str, address: str) -> dict:
     """The host unlinks a wallet from an account. Payments already claimed stay claimed."""
     address = (address or "").strip()
@@ -546,11 +532,10 @@ def _transfers(receipt: dict) -> list[dict]:
     return found
 
 
-async def claim(account: str, agent: str, tx_hash: str) -> dict:
-    """Add credits for a $MEMORIA payment from a linked wallet to the treasury."""
-    tx = (tx_hash or "").strip().lower()
-    if not TX_HASH.match(tx):
-        raise BillingError("That isn't a transaction hash (0x and 64 hex characters).")
+async def _confirmed_transfers(tx: str) -> tuple[int, list[dict]]:
+    """Read a transaction from the chain: (its block, its ERC-20 transfers). Raises
+    BillingError unless it succeeded, has enough confirmations and was made after billing
+    started (so older transfers to the treasury can never become credits)."""
     s = settings()
     try:
         chain = int(await rpc("eth_chainId"), 16)
@@ -571,13 +556,50 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
         raise BillingError("Couldn't reach Robinhood Chain just now. Please try again in a "
                            "minute.") from None
     block = int(receipt["blockNumber"], 16)
+    if block < s["claim_start_block"]:
+        raise BillingError(f"This transfer was made before Memoria billing started (block "
+                           f"{s['claim_start_block']:,}), so it can't be turned into credits.")
     confirmations = latest - block + 1
     if confirmations < s["min_confirmations"]:
         wait = s["min_confirmations"] - confirmations
         raise BillingError(f"The payment has {confirmations} of {s['min_confirmations']} "
                            f"confirmations. Wait for {wait} more block(s), then claim again.")
+    return block, _transfers(receipt)
 
-    transfers = _transfers(receipt)
+
+def _record_payment(conn, tx: str, transfers: list[dict], account: str, agent: str,
+                    block: int, now: str) -> tuple[int, int, int, int, int]:
+    """Store these transfers and add them, with the account's leftover, to its balance.
+    Whole credits become actions; the rest is kept as leftover for the next payment.
+    Returns (total units paid, credits, actions, leftover units, starter actions added)."""
+    s = settings()
+    unit = s["tokens_per_credit"] * 10 ** DECIMALS
+    total = sum(t["amount"] for t in transfers)
+    row, added = _ensure(conn, account)
+    pool = int(row["leftover"] or 0) + total
+    credits, leftover = pool // unit, pool % unit
+    actions = credits * s["actions_per_credit"]
+    for i, t in enumerate(transfers):
+        conn.execute("INSERT INTO payments (tx_hash, log_index, account, agent, from_address, "
+                     "amount, credits, actions, block_number, claimed_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (tx, t["log_index"], account, agent, t["from"], str(t["amount"]),
+                      credits if i == 0 else 0, actions if i == 0 else 0, block, now))
+    conn.execute("UPDATE billing SET actions = actions + ?, leftover = ?, updated_at = ? "
+                 "WHERE account = ?", (actions, str(leftover), now, account))
+    if actions:
+        _reset_alerts(conn, account)
+    return total, credits, actions, leftover, added
+
+
+async def claim(account: str, agent: str, tx_hash: str) -> dict:
+    """Add credits for a $MEMORIA payment from a linked wallet to the treasury. Whatever
+    doesn't make a whole credit is kept and added to the account's next payment."""
+    tx = (tx_hash or "").strip().lower()
+    if not TX_HASH.match(tx):
+        raise BillingError("That isn't a transaction hash (0x and 64 hex characters).")
+    s = settings()
+    block, transfers = await _confirmed_transfers(tx)
     of_token = [t for t in transfers if t["token"] == s["token"]]
     to_treasury = [t for t in of_token if t["to"] == s["treasury"]]
     linked = set(wallets_of(account))
@@ -594,7 +616,6 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
                            "account. Link that wallet first (wallet_challenge, then "
                            "link_wallet), then claim again.")
 
-    unit = s["tokens_per_credit"] * 10 ** DECIMALS
     now = _now()
     try:
         with db.transaction() as conn:
@@ -603,30 +624,109 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
             new = [t for t in mine if t["log_index"] not in done]
             if not new:
                 raise BillingError("This payment was already claimed.")
-            total = sum(t["amount"] for t in new)
-            credits = total // unit
-            if credits < 1:
-                raise BillingError(f"This payment is {_tokens(total)} $MEMORIA, less than 1 "
-                                   f"credit ({s['tokens_per_credit']:,} $MEMORIA), so no "
-                                   "credits could be added.")
-            actions = credits * s["actions_per_credit"]
-            for i, t in enumerate(new):
-                conn.execute("INSERT INTO payments (tx_hash, log_index, account, agent, "
-                             "from_address, amount, credits, actions, block_number, "
-                             "claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (tx, t["log_index"], account, agent, t["from"], str(t["amount"]),
-                              credits if i == 0 else 0, actions if i == 0 else 0, block, now))
-            _, added = _ensure(conn, account)
-            conn.execute("UPDATE billing SET actions = actions + ?, updated_at = ? "
-                         "WHERE account = ?", (actions, now, account))
-            _reset_alerts(conn, account)
+            total, credits, actions, leftover, added = _record_payment(
+                conn, tx, new, account, agent, block, now)
     except sqlite3.IntegrityError:  # claimed by another request at the same moment
         raise BillingError("This payment was already claimed.") from None
     _log_starter(account, agent, added)
     _log(account, agent, "payment", tx_hash=tx, tokens=_tokens(total), credits=credits,
-         actions=actions)
-    return {"claimed": tx, "explorer": f"{EXPLORER_URL}/tx/{tx}", "tokens": _tokens(total),
-            "credits": credits, "actions_added": actions, "balance": balance(account, agent)}
+         actions=actions, leftover=_tokens(leftover))
+    unit = s["tokens_per_credit"] * 10 ** DECIMALS
+    result = {"claimed": tx, "explorer": f"{EXPLORER_URL}/tx/{tx}", "tokens": _tokens(total),
+              "credits": credits, "actions_added": actions,
+              "leftover_tokens": _tokens(leftover),
+              "balance": balance(account, agent)}
+    if leftover:
+        result["message"] = (f"{_tokens(leftover)} $MEMORIA is kept toward your next credit: "
+                             f"{_tokens(unit - leftover)} more makes 1 credit.")
+    return result
+
+
+# ---------- linking a wallet by hand, after a test payment proves it ----------
+
+PROOF_DAYS = 7
+
+
+def admin_proof_request(account: str, address: str) -> dict:
+    """Step 1 of linking a wallet by hand: ask for a small, exact test payment from it.
+    The amount is random, so only the wallet's owner can make a matching payment."""
+    address = (address or "").strip().lower()
+    if accounts.get_account(account) is None:
+        raise BillingError(f"No account called '{account}'.")
+    if not ADDRESS.match(address):
+        raise BillingError("That isn't a wallet address (0x and 40 hex characters).")
+    owner = db.query("SELECT account FROM wallets WHERE address = ?", (address,))
+    if owner and owner[0]["account"] != account:
+        raise BillingError("That wallet is already linked to another Memoria account. "
+                           "A wallet can belong to only one account.")
+    if owner:
+        return {"already_linked": True, "wallets": wallets_of(account)}
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with db.transaction() as conn:
+        row = conn.execute("SELECT * FROM wallet_proofs WHERE account = ? AND address = ? "
+                           "AND used_tx IS NULL AND expires_at > ?",
+                           (account, address, now.isoformat())).fetchone()
+        if row is None:  # 1.000001 to 1.999999 $MEMORIA
+            amount = 10 ** DECIMALS + (secrets.randbelow(999_999) + 1) * 10 ** 12
+            expires = (now + timedelta(days=PROOF_DAYS)).isoformat()
+            conn.execute("INSERT OR REPLACE INTO wallet_proofs (account, address, amount, "
+                         "created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                         (account, address, str(amount), now.isoformat(), expires))
+        else:
+            amount, expires = int(row["amount"]), row["expires_at"]
+    _log(account, ADMIN_AGENT, "wallet_proof_requested", wallet=address, amount=_tokens(amount))
+    return {"already_linked": False, "address": address, "amount": _tokens(amount),
+            "send_to": settings()["treasury"], "expires_at": expires}
+
+
+async def admin_prove_and_link(account: str, address: str, tx_hash: str) -> dict:
+    """Step 2: link the wallet once the chain shows it sent the exact test amount to the
+    treasury. The test payment is stored like any payment (so it can't be used twice) and
+    added to the account's leftover, so nothing is lost."""
+    address = (address or "").strip().lower()
+    tx = (tx_hash or "").strip().lower()
+    if not TX_HASH.match(tx):
+        raise BillingError("That isn't a transaction hash (0x and 64 hex characters).")
+    proof = db.query("SELECT * FROM wallet_proofs WHERE account = ? AND address = ? "
+                     "AND used_tx IS NULL", (account, address))
+    if not proof:
+        raise BillingError(f"No test payment was asked for. First run: link-wallet {account} "
+                           f"{address}")
+    proof = proof[0]
+    if proof["expires_at"] <= _now():
+        raise BillingError("That test payment request expired. Run link-wallet again for a "
+                           "new amount.")
+    s = settings()
+    amount = int(proof["amount"])
+    block, transfers = await _confirmed_transfers(tx)
+    match = [t for t in transfers if t["token"] == s["token"] and t["to"] == s["treasury"]
+             and t["from"] == address and t["amount"] == amount]
+    if not match:
+        raise BillingError(f"This transaction doesn't send exactly {_tokens(amount)} $MEMORIA "
+                           f"from {address} to the treasury ({s['treasury']}).")
+    now = _now()
+    try:
+        with db.transaction() as conn:
+            owner = conn.execute("SELECT account FROM wallets WHERE address = ?",
+                                 (address,)).fetchone()
+            if owner and owner["account"] != account:
+                raise BillingError("That wallet is already linked to another Memoria account.")
+            if conn.execute("SELECT 1 FROM payments WHERE tx_hash = ?", (tx,)).fetchone():
+                raise BillingError("That transaction was already used.")
+            if owner is None:
+                conn.execute("INSERT INTO wallets (address, account, agent, linked_at) "
+                             "VALUES (?, ?, ?, ?)", (address, account, ADMIN_AGENT, now))
+            _, _, _, leftover, added = _record_payment(conn, tx, match[:1], account,
+                                                       ADMIN_AGENT, block, now)
+            conn.execute("UPDATE wallet_proofs SET used_tx = ? WHERE account = ? AND "
+                         "address = ?", (tx, account, address))
+    except sqlite3.IntegrityError:
+        raise BillingError("That transaction was already used.") from None
+    _log_starter(account, ADMIN_AGENT, added)
+    _log(account, ADMIN_AGENT, "link_wallet", wallet=address, by="host", proven_by=tx,
+         linked_at=now)
+    return {"linked": address, "proven_by": tx, "leftover_tokens": _tokens(leftover),
+            "wallets": wallets_of(account)}
 
 
 # ---------- HTTP endpoints for the pay page, and the public purchase history ----------

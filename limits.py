@@ -13,6 +13,8 @@ The counts are kept in memory, so they start again when Memoria restarts. That's
 fine for slowing down spam; the daily write limits (memoria.py) are kept on disk.
 Settings can be changed in .env (see the defaults below).
 """
+import hmac
+import ipaddress
 import os
 import time
 from collections import deque
@@ -98,13 +100,41 @@ def client_ip(scope) -> str:
     and the real address is read from the X-Forwarded-For header the proxy adds.
     Only do that behind a proxy: otherwise anyone could send a fake header.
     """
+    headers = {name.lower(): value for name, value in scope.get("headers", [])}
+    via_site = _from_the_website(headers)
+    if via_site:
+        return via_site
     if _trust_proxy():
-        for name, value in scope.get("headers", []):
-            if name.lower() == b"x-forwarded-for":
-                # The proxy adds the real address at the end; earlier parts could be faked.
-                return value.decode(errors="replace").split(",")[-1].strip()
+        forwarded = headers.get(b"x-forwarded-for")
+        if forwarded:
+            # The proxy adds the real address at the end; earlier parts could be faked.
+            return forwarded.decode(errors="replace").split(",")[-1].strip()
     client = scope.get("client")
     return client[0] if client else "unknown"
+
+
+PROXY_SECRET_HEADER = b"x-memoria-proxy-secret"
+CLIENT_IP_HEADER = b"x-memoria-client-ip"
+
+
+def _from_the_website(headers: dict) -> str | None:
+    """The visitor's real address, for requests forwarded by the Memoria website.
+
+    www.memoriaagent.site/mcp is forwarded to this server by Vercel, so Railway sees
+    Vercel's address for every website visitor, and one person's wrong keys could lock
+    out everyone. The website's routing code (middleware.js) adds the visitor's real
+    address plus a secret only it and this server know (MEMORIA_PROXY_SECRET). The
+    address is trusted ONLY when that secret matches, so nobody else can fake it.
+    """
+    secret = os.environ.get("MEMORIA_PROXY_SECRET", "").strip()
+    sent = headers.get(PROXY_SECRET_HEADER, b"").decode(errors="replace").strip()
+    if not secret or not sent or not hmac.compare_digest(sent, secret):
+        return None
+    claimed = headers.get(CLIENT_IP_HEADER, b"").decode(errors="replace").strip()
+    try:
+        return str(ipaddress.ip_address(claimed))
+    except ValueError:
+        return None
 
 
 def is_this_computer(ip: str) -> bool:

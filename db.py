@@ -20,6 +20,7 @@ What's in it:
   wallet_challenges  one-time messages a wallet signs to prove it belongs to an account
   payments      $MEMORIA payments already claimed (each transfer can be claimed only once)
   outcomes      whether a memory helped: one signed result per agent per memory
+  wallet_proofs test payments the host asked for before linking a wallet by hand
 
 The activity log stays a plain text file (activity.log), easy to read and search.
 
@@ -41,7 +42,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -136,6 +137,7 @@ CREATE TABLE IF NOT EXISTS billing (
     public_purchases INTEGER NOT NULL DEFAULT 0,   -- 1: /purchases/<account> is public
     low_alert_sent   INTEGER NOT NULL DEFAULT 0,   -- 1 once the "low balance" email went out
     empty_alert_sent INTEGER NOT NULL DEFAULT 0,   -- 1 once the "out of actions" email went out
+    leftover         TEXT NOT NULL DEFAULT '0',    -- paid $MEMORIA units not yet a whole credit
     updated_at       TEXT
 );
 CREATE TABLE IF NOT EXISTS wallets (
@@ -179,6 +181,15 @@ CREATE TABLE IF NOT EXISTS outcomes (
     signature   TEXT,                              -- JSON, like memories' signatures
     PRIMARY KEY (memory_id, agent_id)              -- one outcome per agent per memory
 );
+CREATE TABLE IF NOT EXISTS wallet_proofs (
+    account    TEXT NOT NULL,
+    address    TEXT NOT NULL,                     -- lowercase 0x...
+    amount     TEXT NOT NULL,                     -- the exact test amount, in token units
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_tx    TEXT,                              -- the transaction that proved it
+    PRIMARY KEY (account, address)
+);
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
@@ -217,6 +228,9 @@ def connection() -> sqlite3.Connection:
                 if column not in billing_columns:
                     conn.execute(f"ALTER TABLE billing ADD COLUMN {column} INTEGER NOT NULL "
                                  "DEFAULT 0")
+            # Version 6 added leftover $MEMORIA (part of a credit) per account.
+            if "leftover" not in billing_columns:
+                conn.execute("ALTER TABLE billing ADD COLUMN leftover TEXT NOT NULL DEFAULT '0'")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)

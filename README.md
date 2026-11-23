@@ -86,7 +86,14 @@ Settings (Railway Variables): `MEMORIA_BILLING`, `MEMORIA_TREASURY_ADDRESS`, `ME
 `MEMORIA_STARTER_CREDITS`, `MEMORIA_MIN_CONFIRMATIONS` (defaults and meanings in `.env.example`).
 Host commands: `manage_accounts.py balance <account>`, `add-credits` / `remove-credits <account> <credits>`,
 and `link-wallet` / `unlink-wallet <account> <address>`: wallets that can't sign messages can ask
-Memoria to link them by hand (recorded with agent "admin" and logged).
+Memoria to link them by hand. `link-wallet` first gives a small, exact test amount (1 to 2 $MEMORIA)
+for the wallet to send to the treasury; `link-wallet <account> <address> --tx <hash>` then links it
+only if the chain shows that payment (recorded with agent "admin" and logged).
+
+Payments count in whole credits; leftover $MEMORIA is kept per account and added to its next payment.
+Transfers to the treasury from before billing started (`MEMORIA_CLAIM_START_BLOCK`, by default
+block 121276863, that of the first payment) can never be claimed. People who paid but didn't get credits can use
+"Claim a past payment" on the pay page.
 
 ## Saving is instant; processing happens in the background
 Saving, updating and deleting answer straight away. The slow part (Gemini reading the memory and

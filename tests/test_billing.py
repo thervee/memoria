@@ -39,9 +39,11 @@ class FakeChain:
     """Answers billing.rpc() like Robinhood Chain would."""
 
     def __init__(self):
-        self.chain_id, self.latest, self.receipts, self.down = 4663, 1000, {}, False
+        # Realistic block numbers: after billing started (billing.CLAIM_START_BLOCK).
+        self.chain_id, self.latest, self.receipts, self.down = 4663, 121_300_000, {}, False
 
-    def add(self, tx: str, logs: list, block: int = 900, status: str = "0x1") -> str:
+    def add(self, tx: str, logs: list, block: int | None = None, status: str = "0x1") -> str:
+        block = self.latest - 100 if block is None else block
         self.receipts[tx.lower()] = {"status": status, "blockNumber": hex(block), "logs": logs}
         return tx
 
@@ -291,12 +293,66 @@ def test_chain_problems_are_explained(on, chain, setup, error):
         claim(tx_hash(12))
 
 
-def test_less_than_one_credit_is_not_recorded(on, chain):
+def test_less_than_one_credit_is_kept_as_leftover(on, chain):
     wallet = link()
-    tx = chain.add(tx_hash(13), [transfer(wallet.address, amount=UNIT - 1)])
-    with pytest.raises(billing.BillingError, match="less than 1 credit"):
+    tx = chain.add(tx_hash(13), [transfer(wallet.address, amount=4_000 * 10 ** 18)])
+    done = claim(tx)
+    assert done["credits"] == 0 and done["actions_added"] == 0
+    assert done["leftover_tokens"] == "4000"
+    assert "6000 more makes 1 credit" in done["message"]
+    assert db.query("SELECT count(*) FROM payments")[0][0] == 1  # recorded: can't claim twice
+    with pytest.raises(billing.BillingError, match="already claimed"):
         claim(tx)
+    assert actions() == 20
+
+
+def test_leftover_is_added_to_the_next_payment(on, chain):
+    wallet = link()
+    first = claim(chain.add(tx_hash(14), [transfer(wallet.address, amount=15_000 * 10 ** 18)]))
+    assert first["credits"] == 1 and first["leftover_tokens"] == "5000"
+    second = claim(chain.add(tx_hash(15), [transfer(wallet.address, amount=5_000 * 10 ** 18)]))
+    assert second["credits"] == 1 and second["leftover_tokens"] == "0"
+    assert "message" not in second
+    assert actions() == 20 + 2 + 2
+    assert billing.balance("acme")["leftover_tokens"] == "0"
+
+
+def test_leftover_counts_fractions_of_a_token(on, chain):
+    wallet = link()
+    claim(chain.add(tx_hash(16), [transfer(wallet.address, amount=UNIT + 5 * 10 ** 17)]))
+    assert billing.balance("acme")["leftover_tokens"] == "0.5"
+
+
+def test_transfers_from_before_billing_started_can_never_be_claimed(on, chain):
+    wallet = link()
+    start = billing.settings()["claim_start_block"]
+    assert start == 121_276_863  # the block of the first payment
+    old = chain.add(tx_hash(17), [transfer(wallet.address, amount=50 * UNIT)], block=start - 1)
+    with pytest.raises(billing.BillingError, match="before Memoria billing started"):
+        claim(old)
     assert db.query("SELECT count(*) FROM payments")[0][0] == 0
+    at_start = chain.add(tx_hash(18), [transfer(wallet.address)], block=start)
+    assert claim(at_start)["credits"] == 1  # the launch block itself counts
+
+
+def test_nomad_ais_payment_in_block_121327603_is_still_claimable(on, chain):
+    """The real payment 0x90b2...42ea (28 credits) is in block 121327603, after the start."""
+    accounts.create_account("nomad-ai", email="dev@nomad.example")
+    accounts.create_key("nomad-ai", "main")
+    wallet = link("nomad-ai", "main")
+    chain.latest = 121_327_603 + 100
+    tx = chain.add("0x90b2690813329e5ef22599ba40717600eea6afb0ea921369196627f4831042ea",
+                   [transfer(wallet.address, amount=28 * UNIT)], block=121_327_603)
+    done = claim(tx, "nomad-ai", "main")
+    assert done["credits"] == 28 and done["actions_added"] == 56
+
+
+def test_the_start_block_can_be_changed(on, chain, monkeypatch):
+    wallet = link()
+    monkeypatch.setenv("MEMORIA_CLAIM_START_BLOCK", str(chain.latest - 50))
+    tx = chain.add(tx_hash(19), [transfer(wallet.address)], block=chain.latest - 100)
+    with pytest.raises(billing.BillingError, match="before Memoria billing started"):
+        claim(tx)
 
 
 def test_a_bad_hash_is_refused(on):
@@ -621,47 +677,106 @@ def test_older_databases_get_the_new_tables(keys, tmp_path, monkeypatch):
     assert accounts.get_account("acme")["id"] == "acme"  # existing data kept
 
 
-# ---------- linking a wallet by hand (manage_accounts.py link-wallet / unlink-wallet) ----------
+# ---------- linking a wallet by hand, after a test payment (manage_accounts.py) ----------
 
-def test_admin_links_a_wallet_without_a_signature(on, chain, capsys):
+def proof_amount(account="acme", address=None) -> int:
+    return int(db.query("SELECT amount FROM wallet_proofs WHERE account = ? AND address = ?",
+                        (account, address.lower()))[0][0])
+
+
+def test_hand_linking_asks_for_an_exact_test_payment_first(on, chain, capsys):
     wallet = Account.create().address
     manage_accounts.main(["link-wallet", "acme", wallet])
+    out = capsys.readouterr().out
+    assert "send EXACTLY" in out and "--tx" in out
+    assert billing.wallets_of("acme") == []  # nothing linked yet
+    amount = proof_amount(address=wallet)
+    assert 10 ** 18 < amount < 2 * 10 ** 18  # between 1 and 2 $MEMORIA
+    again = billing.admin_proof_request("acme", wallet)  # asking again gives the same amount
+    assert again["amount"] == billing._tokens(amount)
+    assert again["amount"] in out
+
+
+def test_the_exact_test_payment_links_the_wallet(on, chain, capsys):
+    wallet = Account.create().address
+    billing.admin_proof_request("acme", wallet)
+    amount = proof_amount(address=wallet)
+    tx = chain.add(tx_hash(90), [transfer(wallet, amount=amount)])
+    manage_accounts.main(["link-wallet", "acme", wallet, "--tx", tx])
     assert "Linked" in capsys.readouterr().out
-    row = db.query("SELECT account, agent, linked_at FROM wallets WHERE address = ?",
-                   (wallet.lower(),))[0]
-    assert row["account"] == "acme" and row["agent"] == "admin" and row["linked_at"]
+    row = db.query("SELECT account, agent FROM wallets WHERE address = ?", (wallet.lower(),))[0]
+    assert (row["account"], row["agent"]) == ("acme", "admin")
     entry = [e for e in (m.json.loads(line) for line in m.ACTIVITY_FILE.read_text()
                          .splitlines()) if e["action"] == "link_wallet"][-1]
-    assert entry["agent"] == "acme/admin" and entry["by"] == "host"
-    assert entry["wallet"] == wallet.lower() and entry["linked_at"] == row["linked_at"]
-    # payments from it can now be claimed, like any linked wallet
-    assert claim(chain.add(tx_hash(70), [transfer(wallet)]))["credits"] == 1
+    assert entry["by"] == "host" and entry["proven_by"] == tx and entry["linked_at"]
+    # the test payment can't be claimed again, and counts toward the next credit
+    with pytest.raises(billing.BillingError, match="already claimed"):
+        claim(tx)
+    assert billing.balance("acme")["leftover_tokens"] == billing._tokens(amount)
+    # payments from it can now be claimed like any linked wallet
+    assert claim(chain.add(tx_hash(91), [transfer(wallet)]))["credits"] == 1
 
 
-def test_admin_link_follows_the_same_rules(on):
-    wallet = link("globex")
-    with pytest.raises(SystemExit):
-        manage_accounts.main(["link-wallet", "acme", wallet.address])  # another account's
+@pytest.mark.parametrize("change, error", [
+    (lambda w, a: transfer(w, amount=a + 1), "doesn't send exactly"),          # wrong amount
+    (lambda w, a: transfer(STRANGER, amount=a), "doesn't send exactly"),       # wrong sender
+    (lambda w, a: transfer(w, to=STRANGER, amount=a), "doesn't send exactly"),  # not treasury
+    (lambda w, a: transfer(w, amount=a, token=OTHER_TOKEN), "doesn't send exactly"),
+])
+def test_anything_but_the_exact_test_payment_is_refused(on, chain, change, error):
+    wallet = Account.create().address
+    billing.admin_proof_request("acme", wallet)
+    tx = chain.add(tx_hash(92), [change(wallet, proof_amount(address=wallet))])
+    with pytest.raises(billing.BillingError, match=error):
+        asyncio.run(billing.admin_prove_and_link("acme", wallet, tx))
+    assert billing.wallets_of("acme") == []
+
+
+def test_hand_linking_needs_a_request_first_and_it_expires(on, chain, monkeypatch):
+    wallet = Account.create().address
+    tx = chain.add(tx_hash(93), [transfer(wallet, amount=10 ** 18 + 10 ** 12)])
+    with pytest.raises(billing.BillingError, match="No test payment was asked for"):
+        asyncio.run(billing.admin_prove_and_link("acme", wallet, tx))
+    billing.admin_proof_request("acme", wallet)
+    monkeypatch.setattr(billing, "_now", lambda: "2999-01-01T00:00:00+00:00")
+    with pytest.raises(billing.BillingError, match="expired"):
+        asyncio.run(billing.admin_prove_and_link("acme", wallet, tx))
+
+
+def test_hand_linking_follows_the_same_rules(on, chain):
+    taken = link("globex")
+    with pytest.raises(billing.BillingError, match="another Memoria account"):
+        billing.admin_proof_request("acme", taken.address)
     with pytest.raises(SystemExit):
         manage_accounts.main(["link-wallet", "acme", "0x1234"])        # not an address
     with pytest.raises(SystemExit):
         manage_accounts.main(["link-wallet", "nobody", Account.create().address])
-    assert billing.wallets_of("acme") == []
-    assert billing.admin_link_wallet("globex", wallet.address)["already_linked"] is True
+    assert billing.admin_proof_request("globex", taken.address)["already_linked"] is True
+
+
+def test_an_old_test_payment_cant_prove_a_wallet(on, chain):
+    wallet = Account.create().address
+    billing.admin_proof_request("acme", wallet)
+    start = billing.settings()["claim_start_block"]
+    tx = chain.add(tx_hash(94), [transfer(wallet, amount=proof_amount(address=wallet))],
+                   block=start - 1)
+    with pytest.raises(billing.BillingError, match="before Memoria billing started"):
+        asyncio.run(billing.admin_prove_and_link("acme", wallet, tx))
 
 
 def test_admin_unlinks_a_wallet(on, chain, capsys):
     wallet = Account.create().address
-    billing.admin_link_wallet("acme", wallet)
+    billing.admin_proof_request("acme", wallet)
+    asyncio.run(billing.admin_prove_and_link(
+        "acme", wallet, chain.add(tx_hash(95), [transfer(wallet, amount=proof_amount(
+            address=wallet))])))
     with pytest.raises(SystemExit):
         manage_accounts.main(["unlink-wallet", "globex", wallet])  # not globex's to unlink
     assert billing.wallets_of("acme") == [wallet.lower()]
     manage_accounts.main(["unlink-wallet", "acme", wallet])
     assert "Unlinked" in capsys.readouterr().out and billing.wallets_of("acme") == []
     with pytest.raises(billing.BillingError, match="isn't linked to your account"):
-        claim(chain.add(tx_hash(71), [transfer(wallet)]))
-    assert "unlink_wallet" in [m.json.loads(line)["action"] for line in
-                               m.ACTIVITY_FILE.read_text().splitlines()]
+        claim(chain.add(tx_hash(96), [transfer(wallet)]))
 
 
 # ---------- what costs an action, and the "balance low" note ----------

@@ -25,9 +25,14 @@ Paying with $MEMORIA (see billing.py):
     python manage_accounts.py public-purchases <account> on|off
         Show (or hide) the account's purchase history at /purchases/<account>.
     python manage_accounts.py link-wallet <account> <address>
-        Link a wallet to an account by hand, without a signature, for agents whose
-        wallets can't sign messages. A wallet can belong to only one account; the link is
-        recorded with agent "admin" and logged.
+    python manage_accounts.py link-wallet <account> <address> --tx <transaction hash>
+        Link a wallet by hand, for agents whose wallets can't sign messages. It needs proof
+        that the wallet is theirs: the first command gives a small, exact test amount of
+        $MEMORIA (between 1 and 2, valid 7 days) for the wallet to send to the treasury;
+        once it's sent, run the command again with --tx and the wallet is linked only if
+        the chain shows that exact payment. The test payment counts toward the account's
+        next credit. A wallet can belong to only one account; the link is recorded with
+        agent "admin" and logged.
     python manage_accounts.py unlink-wallet <account> <address>
         Unlink a wallet from an account (payments already claimed stay claimed). Logged.
 
@@ -117,6 +122,8 @@ def main(argv=None) -> None:
         wallet = commands.add_parser(name)
         wallet.add_argument("account")
         wallet.add_argument("address")
+        if name == "link-wallet":
+            wallet.add_argument("--tx", default="", help="the test payment's transaction hash")
     public = commands.add_parser("public-purchases")
     public.add_argument("account")
     public.add_argument("setting", choices=["on", "off"])
@@ -165,10 +172,23 @@ def main(argv=None) -> None:
             print(f"{'Added' if sign > 0 else 'Removed'} {args.credits} credits. "
                   f"'{args.account}' now has {info['actions']} actions "
                   f"({info['credits']} credits).")
+        elif args.command == "link-wallet" and args.tx:
+            import asyncio
+            done = asyncio.run(billing.admin_prove_and_link(args.account, args.address, args.tx))
+            print(f"Linked {done['linked']} to '{args.account}' (proven by {done['proven_by']}). "
+                  f"Wallets: {', '.join(done['wallets'])}")
         elif args.command == "link-wallet":
-            done = billing.admin_link_wallet(args.account, args.address)
-            print(f"{'Already linked' if done['already_linked'] else 'Linked'} "
-                  f"{done['linked']} to '{args.account}'. Wallets: {', '.join(done['wallets'])}")
+            ask = billing.admin_proof_request(args.account, args.address)
+            if ask["already_linked"]:
+                print(f"Already linked to '{args.account}'. Wallets: {', '.join(ask['wallets'])}")
+            else:
+                print("To prove the wallet is theirs, the owner must send EXACTLY "
+                      f"{ask['amount']} $MEMORIA")
+                print(f"  from {ask['address']}")
+                print(f"  to   {ask['send_to']} (the Memoria treasury, on Robinhood Chain)")
+                print(f"before {ask['expires_at']}. Then run:")
+                print(f"  python manage_accounts.py link-wallet {args.account} "
+                      f"{ask['address']} --tx <transaction hash>")
         elif args.command == "unlink-wallet":
             done = billing.admin_unlink_wallet(args.account, args.address)
             print(f"Unlinked {done['unlinked']} from '{args.account}'. "
