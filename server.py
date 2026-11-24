@@ -101,6 +101,28 @@ def _capped(receive, most: int):
     return wrapped
 
 
+# Lets MCP clients that run in a web browser use /mcp. Safe for any website: every request
+# still needs an API key or login pass in its Authorization header (no cookies are used).
+CORS_HEADERS = [
+    (b"access-control-allow-origin", b"*"),
+    (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+    (b"access-control-allow-headers",
+     b"authorization, content-type, mcp-session-id, mcp-protocol-version"),
+    (b"access-control-expose-headers", b"mcp-session-id"),
+]
+
+
+def _with_cors(send):
+    """Add the CORS headers to every response sent through `send`."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            names = {k.lower() for k, _ in message.get("headers", [])}
+            extra = [(k, v) for k, v in CORS_HEADERS if k not in names]
+            message = dict(message, headers=[*message.get("headers", []), *extra])
+        await send(message)
+    return wrapped
+
+
 class LoginCheck:
     """Checks every request before it reaches Memoria: limits first, then the login."""
 
@@ -110,6 +132,13 @@ class LoginCheck:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":  # start-up / shut-down messages pass straight through
             return await self.app(scope, receive, send)
+        if scope.get("path", "").rstrip("/") == "/mcp":
+            send = _with_cors(send)
+            # A browser asks first whether it may send the request ("preflight"). It sends
+            # no Authorization header with this question, so answer it before the login check.
+            if scope.get("method") == "OPTIONS":
+                await send({"type": "http.response.start", "status": 204, "headers": []})
+                return await send({"type": "http.response.body", "body": b""})
         ip = limits.client_ip(scope)
 
         # 1. Spam protection: too many requests from this address?
@@ -205,22 +234,23 @@ async def _charged(account: str, agent_id: str, tool: str, work):
     `work` makes the action when called, so nothing runs if the balance is empty.
     """
     try:
-        charged = billing.charge(account, agent_id, tool)
+        # (database work: in a worker thread, so other requests aren't held up)
+        charged = await asyncio.to_thread(billing.charge, account, agent_id, tool)
     except billing.BillingError as e:
         raise ToolError(str(e)) from e
     try:
         result = await _run(work())
     except BaseException:
         if charged:
-            billing.refund(account, agent_id, tool)
+            await asyncio.to_thread(billing.refund, account, agent_id, tool)
         raise
-    return _noted(account, result)
+    return await _noted(account, result)
 
 
-def _noted(account: str, result):
+async def _noted(account: str, result):
     """Add a short "balance low" note when the account is nearly out of actions
     (on a list of memories, it goes on the first one)."""
-    note = billing.low_balance_note(account)
+    note = await asyncio.to_thread(billing.low_balance_note, account)
     if not note:
         return result
     if isinstance(result, dict):
@@ -321,7 +351,7 @@ async def record_outcome(memory_id: str, result: str, ctx: Context, note: str = 
         note: Optional: what happened, up to 500 characters, e.g. "rugged".
     """
     agent_id, account = _writer(ctx)
-    return _noted(account, await _run(memoria.record_outcome(agent_id, memory_id, result, note,
+    return await _noted(account, await _run(memoria.record_outcome(agent_id, memory_id, result, note,
                                                              account=account)))
 
 
@@ -382,7 +412,7 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
             "The agents you shared this with spend their own account's actions (this "
             "account's balance, since all its agents share one) when they find or list it: "
             "1 action each time.")
-    return _noted(account, result)
+    return await _noted(account, result)
 
 
 @mcp.tool()
@@ -396,7 +426,7 @@ async def delete_memory(memory_id: str, ctx: Context) -> dict:
         memory_id: The memory's ID (like "mem-1a2b3c4d"), from find_memory or save_memory.
     """
     agent_id, account = _writer(ctx)
-    return _noted(account, await _run(memoria.delete_memory(agent_id, memory_id,
+    return await _noted(account, await _run(memoria.delete_memory(agent_id, memory_id,
                                                             account=account)))
 
 
@@ -428,7 +458,7 @@ async def wallet_challenge(ctx: Context) -> dict:
     Signing is free and does not move any tokens.
     """
     agent_id, account = _payer(ctx)
-    return _noted(account, await _billing(lambda: billing.challenge(account, agent_id)))
+    return await _noted(account, await _billing(lambda: billing.challenge(account, agent_id)))
 
 
 async def link_wallet(address: str, signature: str, ctx: Context) -> dict:
@@ -442,7 +472,7 @@ async def link_wallet(address: str, signature: str, ctx: Context) -> dict:
         signature: The wallet's personal_sign signature of the challenge message (0x...).
     """
     agent_id, account = _payer(ctx)
-    return _noted(account, await _billing(
+    return await _noted(account, await _billing(
         lambda: billing.link_wallet(account, agent_id, address, signature)))
 
 
@@ -457,7 +487,7 @@ async def claim_payment(tx_hash: str, ctx: Context) -> dict:
         tx_hash: The payment's transaction hash (0x and 64 hex characters).
     """
     agent_id, account = _payer(ctx)
-    return _noted(account, await _billing(lambda: billing.claim(account, agent_id, tx_hash)))
+    return await _noted(account, await _billing(lambda: billing.claim(account, agent_id, tx_hash)))
 
 
 async def get_balance(ctx: Context) -> dict:
@@ -467,7 +497,7 @@ async def get_balance(ctx: Context) -> dict:
     delete_memory, get_balance, wallet_challenge, link_wallet and claim_payment are free.
     """
     agent_id, account = _payer(ctx)
-    return _noted(account, await _billing(lambda: billing.balance(account, agent_id)))
+    return await _noted(account, await _billing(lambda: billing.balance(account, agent_id)))
 
 
 BILLING_TOOLS = (wallet_challenge, link_wallet, claim_payment, get_balance)
@@ -494,7 +524,7 @@ async def health(scope, receive, send) -> None:
     """GET /health: is Memoria up and can it reach its database? (Railway checks this.)"""
     try:
         import db
-        db.query("SELECT 1")
+        await asyncio.to_thread(db.query, "SELECT 1")
         status, body = 200, {"status": "ok"}
     except Exception:
         status, body = 503, {"status": "database unavailable"}

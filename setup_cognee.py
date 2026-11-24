@@ -54,6 +54,33 @@ import fastembed  # noqa: E402
 _fastembed_engine = importlib.import_module(
     "cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine")
 
+def _plain_console_logs() -> None:
+    """Make Cognee's console log print errors as plain text.
+
+    Cognee's console log draws each error's traceback with Rich (colours, boxes and
+    source lines). That runs on the same thread as every request and can take ~25
+    seconds, so whenever Cognee logged a failure (e.g. Gemini down or over its limit)
+    the whole server froze. Plain tracebacks carry the same information and print at
+    once. Memoria's own one-line "background work failed" messages are unaffected.
+    """
+    import logging
+
+    import structlog
+
+    plain = structlog.stdlib.ProcessorFormatter(
+        processor=structlog.dev.ConsoleRenderer(
+            colors=False, exception_formatter=structlog.dev.plain_traceback))
+    loggers = [logging.getLogger()] + [
+        logging.getLogger(name) for name in list(logging.root.manager.loggerDict)
+        if name.startswith(("cognee", "run_tasks"))]
+    for logger in loggers:
+        for handler in logger.handlers:
+            if isinstance(handler.formatter, structlog.stdlib.ProcessorFormatter):
+                handler.setFormatter(plain)
+
+
+_plain_console_logs()
+
 cognee.config.data_root_directory(str(STORE / "data"))
 cognee.config.system_root_directory(str(STORE / "system"))
 

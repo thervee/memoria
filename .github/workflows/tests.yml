@@ -29,11 +29,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run the tests
-        # The one test left out starts a whole online server and can hang; it's skipped here
-        # as it is when the tests are run by hand.
-        run: >-
-          python -m pytest -q -p no:logging
-          --deselect "tests/test_online.py::test_memoria_runs_online_with_all_data_in_the_data_folder"
+        run: python -m pytest -q -p no:logging
         env:
           TELEMETRY_DISABLED: "true"
           COGNEE_SKIP_CONNECTION_TEST: "true"

@@ -630,7 +630,7 @@ async def record_outcome(agent_id: str, memory_id: str, result: str, note: str =
     note = (note or "").strip()
     if len(note) > MAX_OUTCOME_NOTE:
         raise MemoriaError(f"note can be {MAX_OUTCOME_NOTE} characters at most.")
-    async with _write_lock:
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
         _readable(memory_id, agent_id, account, "record an outcome for")
         previous = db.get_outcome(memory_id, agent_id)
         outcome = {"memory_id": memory_id, "account": account, "agent_id": agent_id,
@@ -642,9 +642,13 @@ async def record_outcome(agent_id: str, memory_id: str, result: str, note: str =
         sig["signed_at"] = _now()
         outcome["signature"] = sig
         db.put_outcome(outcome)
+        return previous, outcome
+    async with _write_lock:
+        previous, outcome = await asyncio.to_thread(in_database)
     _log(who, "outcome", memory_id=memory_id, result=result,
          **({"replaced": previous["result"]} if previous else {}))
-    summary = _outcome_summary(db.outcomes_for([memory_id]).get(memory_id, []))
+    outcomes = await asyncio.to_thread(lambda: db.outcomes_for([memory_id]).get(memory_id, []))
+    summary = _outcome_summary(outcomes)
     return {"memory_id": memory_id, "recorded": _outcome_public(outcome),
             "replaced": previous["result"] if previous else None,
             "outcomes": {k: v for k, v in summary.items() if not k.startswith("_")}}
@@ -708,7 +712,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
     if topic:
         topic = _require(topic, "topic")
 
-    async with _write_lock:
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
@@ -735,6 +739,9 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         _sign(mem, who)  # the new version is signed by the agent that changed it
         _mark_changed(mem)  # the background worker updates it in Cognee
         db.put_memory(mem)
+        return mem
+    async with _write_lock:
+        mem = await asyncio.to_thread(in_database)
     _log(who, "update", memory_id=memory_id)
     _kick()
     out = _public(mem)
@@ -748,7 +755,7 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
     """Change who can read a memory. Only the agent that wrote it may do this."""
     agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
-    async with _write_lock:
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'. Use find_memory to look it up.")
@@ -759,6 +766,9 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
         before = (mem.get("visibility", "private"), mem.get("shared_with", []))
         mem["visibility"], mem["shared_with"] = _check_sharing(visibility, shared_with, agent_id)
         db.put_memory(mem)
+        return mem, before
+    async with _write_lock:
+        mem, before = await asyncio.to_thread(in_database)
     _log(identity.principal(account, agent_id), "share", memory_id=memory_id,
          before={"visibility": before[0], "shared_with": before[1]},
          after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
@@ -784,7 +794,7 @@ async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
     """Delete a memory for good. Only the agent that wrote it may do this."""
     agent_id = check_agent(agent_id, account)
     memory_id = _require(memory_id, "memory_id")
-    async with _write_lock:
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
             raise MemoriaError(f"No memory with ID '{memory_id}'.")
@@ -798,6 +808,9 @@ async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
             # If it was never added to Cognee, the worker notices that and skips it.
             if mem.get("data_id"):
                 db.queue_forget(mem["data_id"], mem["dataset_id"], memory_id)
+        return mem
+    async with _write_lock:
+        mem = await asyncio.to_thread(in_database)
     _log(identity.principal(account, agent_id), "delete", memory_id=memory_id, topic=mem["topic"],
          **({"via": via} if via else {}))
     _kick()
@@ -845,10 +858,19 @@ def start_background_work() -> None:
         _kick()
 
 
-def _background_error(what: str, error: Exception) -> None:
+def _background_error(what: str, error: Exception) -> str:
     message = f"{type(error).__name__}: {error}"
     print(f"Memoria background work failed ({what}): {message}", file=sys.stderr)
     _log("memoria", "background_error", what=what, error=message)
+    return message
+
+
+async def _sync_failed(mem: dict, message: str) -> None:
+    """Count a failed try at sending this memory to Cognee; give up after db.SYNC_GIVE_UP."""
+    async with _write_lock:
+        gave_up = db.sync_failed(mem["id"], message)
+    if gave_up:
+        _log("memoria", "background_gave_up", memory_id=mem["id"], error=message)
 
 
 async def _work_loop() -> None:
@@ -900,28 +922,40 @@ async def _work_once() -> bool:
                                              node_set=node_set)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(result["error"])
-                db.mark_synced(mem["id"], mem["sync_version"], processed=True)
+                async with _write_lock:
+                    db.mark_synced(mem["id"], mem["sync_version"], processed=True)
             else:
                 result = await _engine().add(_as_text(mem), dataset_name=dataset_for(account_of(mem)),
                                           node_set=node_set)
                 data_id, dataset_id = str(result.data_ids[0]), str(result.dataset_id)
-                if db.record_added(mem["id"], data_id, dataset_id, mem["sync_version"]):
-                    added.append(mem)
-                else:  # deleted while being added: remove it from Cognee too
-                    db.queue_forget(data_id, dataset_id, mem["id"])
+                # (with _write_lock, the worker's changes never land in the middle of an
+                # update or delete, which run in a worker thread)
+                async with _write_lock:
+                    if db.record_added(mem["id"], data_id, dataset_id, mem["sync_version"]):
+                        added.append(mem)
+                    else:  # deleted while being added: remove it from Cognee too
+                        db.queue_forget(data_id, dataset_id, mem["id"])
         except Exception as e:
             ok = False
-            _background_error(f"storing {mem['id']}", e)
+            await _sync_failed(mem, _background_error(f"storing {mem['id']}", e))
 
-    # 3. Cognee reads all newly added memories in ONE run and builds the graph.
-    if added:
+    # 3. Cognee reads the newly added memories and builds the graph: one run per account,
+    #    so one account's failure can't hold up another account's memories.
+    by_dataset: dict[str, list[dict]] = {}
+    for mem in added:
+        by_dataset.setdefault(dataset_for(account_of(mem)), []).append(mem)
+    for dataset, mems in sorted(by_dataset.items()):
         try:
-            await _engine().cognify(datasets=sorted({dataset_for(account_of(m)) for m in added}))
+            await _engine().cognify(datasets=[dataset])
         except Exception as e:
-            _background_error("building the knowledge graph", e)
-            return False  # the memories stay "processing"; next pass tries again
-        for mem in added:
-            db.mark_synced(mem["id"], mem["sync_version"], processed=True)
+            ok = False  # these memories stay "processing"; a later pass tries again
+            message = _background_error("building the knowledge graph", e)
+            for mem in mems:
+                await _sync_failed(mem, message)
+            continue
+        async with _write_lock:
+            for mem in mems:
+                db.mark_synced(mem["id"], mem["sync_version"], processed=True)
     return ok
 
 

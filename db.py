@@ -42,7 +42,10 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+# Stop sending a memory to Cognee after this many failed tries (it stays "processing"
+# and is still found by its exact words). Saving a new version gives it fresh tries.
+SYNC_GIVE_UP = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -66,7 +69,9 @@ CREATE TABLE IF NOT EXISTS memories (
     processed     INTEGER,
     added_version INTEGER,
     data_id       TEXT,                         -- where Cognee keeps it
-    dataset_id    TEXT
+    dataset_id    TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,   -- failed tries at sending this version to Cognee
+    last_error    TEXT                          -- why the last try failed
 );
 CREATE INDEX IF NOT EXISTS memories_by_owner ON memories(account, agent_id);
 CREATE INDEX IF NOT EXISTS memories_waiting ON memories(needs_sync) WHERE needs_sync = 1;
@@ -231,6 +236,12 @@ def connection() -> sqlite3.Connection:
             # Version 6 added leftover $MEMORIA (part of a credit) per account.
             if "leftover" not in billing_columns:
                 conn.execute("ALTER TABLE billing ADD COLUMN leftover TEXT NOT NULL DEFAULT '0'")
+            # Version 7 added failed tries per memory; older memories start with none.
+            memory_columns = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+            if "attempts" not in memory_columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "last_error" not in memory_columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN last_error TEXT")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)
@@ -310,7 +321,10 @@ def _to_memory(row: sqlite3.Row | None) -> dict | None:
 
 _UPSERT = (f"INSERT INTO memories ({', '.join(MEMORY_FIELDS)}) "
            f"VALUES ({', '.join('?' for _ in MEMORY_FIELDS)}) ON CONFLICT(id) DO UPDATE SET "
-           + ", ".join(f"{f} = excluded.{f}" for f in MEMORY_FIELDS if f != "id"))
+           + ", ".join(f"{f} = excluded.{f}" for f in MEMORY_FIELDS if f != "id")
+           # A new version (e.g. an update) gets fresh tries at reaching Cognee.
+           + ", attempts = CASE WHEN excluded.sync_version != memories.sync_version THEN 0 "
+             "ELSE memories.attempts END")
 
 
 _INSERT_NEW = (f"INSERT OR IGNORE INTO memories ({', '.join(MEMORY_FIELDS)}) "
@@ -451,9 +465,22 @@ def all_memories() -> list[dict]:
 
 
 def waiting_memories() -> list[dict]:
-    """Memories whose latest version Cognee doesn't have yet."""
+    """Memories whose latest version Cognee doesn't have yet, fewest failed tries first
+    (so memories that keep failing never hold up new ones), leaving out those Memoria
+    gave up on (SYNC_GIVE_UP)."""
     return [_to_memory(row) for row in
-            query("SELECT * FROM memories WHERE needs_sync = 1 ORDER BY created_at, id")]
+            query("SELECT * FROM memories WHERE needs_sync = 1 AND attempts < ? "
+                  "ORDER BY attempts, created_at, id", (SYNC_GIVE_UP,))]
+
+
+def sync_failed(memory_id: str, error: str) -> bool:
+    """Note one failed try at sending a memory to Cognee. True if Memoria now gives up."""
+    with transaction() as conn:
+        conn.execute("UPDATE memories SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+                     (error[:1000], memory_id))
+        row = conn.execute("SELECT attempts FROM memories WHERE id = ?",
+                           (memory_id,)).fetchone()
+        return bool(row) and row["attempts"] >= SYNC_GIVE_UP
 
 
 def record_added(memory_id: str, data_id: str, dataset_id: str, version: int) -> bool:
@@ -520,8 +547,8 @@ def forget_tried(data_id: str, done: bool, give_up_after: int) -> bool:
 
 
 def has_work() -> bool:
-    return bool(query("SELECT 1 FROM memories WHERE needs_sync = 1 "
-                      "UNION ALL SELECT 1 FROM forget_queue LIMIT 1"))
+    return bool(query("SELECT 1 FROM memories WHERE needs_sync = 1 AND attempts < ? "
+                      "UNION ALL SELECT 1 FROM forget_queue LIMIT 1", (SYNC_GIVE_UP,)))
 
 
 # ---------- importing Memoria's older JSON files ----------

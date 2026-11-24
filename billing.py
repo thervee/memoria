@@ -796,7 +796,7 @@ async def app(scope, receive, send) -> None:
     auth = dict(scope.get("headers", [])).get(b"authorization", b"").decode(errors="replace")
     key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     try:
-        account, agent = accounts.check_key(key)
+        account, agent = await asyncio.to_thread(accounts.check_key, key)
     except accounts.AccountError:
         limits.failed_logins.hit(ip)
         return await answer(send, 401, error("That API key isn't valid. Check you copied all "
@@ -820,15 +820,17 @@ async def app(scope, receive, send) -> None:
         except ValueError:
             return await answer(send, 400, error("Send JSON."), cors)
     try:
+        # (database work: in a worker thread, so other requests aren't held up)
         if path == "/billing/challenge":
-            result = challenge(account, agent)
+            result = await asyncio.to_thread(challenge, account, agent)
         elif path == "/billing/link":
-            result = link_wallet(account, agent, str(data.get("address", "")),
-                                 str(data.get("signature", "")))
+            result = await asyncio.to_thread(link_wallet, account, agent,
+                                             str(data.get("address", "")),
+                                             str(data.get("signature", "")))
         elif path == "/billing/claim":
             result = await claim(account, agent, str(data.get("tx_hash", "")))
         else:
-            result = balance(account, agent)
+            result = await asyncio.to_thread(balance, account, agent)
     except BillingError as e:
         return await answer(send, 400, error(str(e)), cors)
     return await answer(send, 200, result, cors)

@@ -292,8 +292,11 @@ def test_memoria_runs_online_with_all_data_in_the_data_folder(tmp_path):
                     MEMORIA_HOST="127.0.0.1")  # (0.0.0.0 would make Windows ask about the firewall)
     before = sorted(p.name for p in (HERE / "memory_store").glob("*")) \
         if (HERE / "memory_store").exists() else []
+    # The server's output goes to a file: a pipe nobody reads fills up and freezes the server.
+    log_file = tmp_path / "server.log"
+    log = open(log_file, "w", encoding="utf-8")
     proc = subprocess.Popen([PYTHON, "server.py"], cwd=HERE, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            stdout=log, stderr=subprocess.STDOUT, text=True)
     try:
         for _ in range(120):
             try:
@@ -302,7 +305,7 @@ def test_memoria_runs_online_with_all_data_in_the_data_folder(tmp_path):
             except OSError:
                 time.sleep(0.5)
         else:
-            pytest.fail("Memoria didn't start: " + proc.stdout.read())
+            pytest.fail("Memoria didn't start: " + log_file.read_text(encoding="utf-8"))
         assert status == 200 and json.loads(body) == {"status": "ok"}
         assert get(f"http://127.0.0.1:{port}/dashboard")[0] == 401  # no dashboard online
         assert get(f"http://127.0.0.1:{port}/signup")[0] == 404     # sign-up off by default
@@ -322,10 +325,15 @@ def test_memoria_runs_online_with_all_data_in_the_data_folder(tmp_path):
         async def use_it():
             async with Memoria(api_key=key, url=f"http://127.0.0.1:{port}/mcp") as mem:
                 return await mem.find("anything")
-        assert asyncio.run(use_it()) == []
+        assert asyncio.run(asyncio.wait_for(use_it(), timeout=30)) == []
     finally:
         proc.terminate()
-        proc.wait(timeout=30)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+        log.close()
 
     # Everything landed in the data folder...
     assert (data / "memory_store" / "memoria.db").exists()
