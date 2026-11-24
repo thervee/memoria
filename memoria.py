@@ -377,7 +377,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
                       confidence: str = "medium", visibility: str = "private",
                       shared_with: list[str] | None = None, account: str = LOCAL,
                       source: str | None = None) -> dict:
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     who = identity.principal(account, agent_id)
     visibility, shared_with = _check_sharing(visibility, shared_with, agent_id)
     source = _check_source(source)
@@ -397,7 +397,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
     }
     _sign(mem, who)  # prove this agent wrote it
     _mark_changed(mem)  # the background worker adds it to Cognee
-    async with _write_lock:
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
         _use_quota(account, new_memory=True)
         # Never replace an existing memory (of any account). An ID that is already
         # taken just gets a new one; with 128 random bits that should never happen.
@@ -408,6 +408,8 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
             _sign(mem, who)  # the ID is part of what's signed
         else:
             raise MemoriaError("Could not save the memory just now. Please try again.")
+    async with _write_lock:
+        await asyncio.to_thread(in_database)
     _log(who, "save", memory_id=mem["id"], topic=mem["topic"])
     _kick()
     return _public(mem)
@@ -416,7 +418,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
 async def find_memory(agent_id: str, query: str, topic: str | None = None,
                       saved_by: str | None = None, limit: int = 5,
                       account: str = LOCAL, outcome: str | None = None) -> list[dict]:
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     outcome = _check_outcome_filter(outcome)
     query = _require(query, "query")
     limit = max(1, min(int(limit or 5), 20))
@@ -509,7 +511,7 @@ async def list_memories(agent_id: str, topic: str | None = None, saved_by: str |
     topic matches that topic and everything under it ("customers/" or "customers" also
     finds "customers/acme"). Uses the same permission check as find_memory.
     """
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     topic = (topic or "").strip().strip("/") or None
     if topic and len(topic) > MAX_LENGTHS["topic"]:
         raise MemoriaError(f"topic can be {MAX_LENGTHS['topic']} characters at most.")
@@ -621,7 +623,7 @@ async def record_outcome(agent_id: str, memory_id: str, result: str, note: str =
                          account: str = LOCAL) -> dict:
     """Record whether a memory helped. One outcome per agent per memory: recording again
     replaces this agent's earlier one. Any agent that may read the memory can do this."""
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     who = identity.principal(account, agent_id)
     memory_id = _require(memory_id, "memory_id")
     result = (result or "").strip().lower()
@@ -656,7 +658,7 @@ async def record_outcome(agent_id: str, memory_id: str, result: str, note: str =
 
 async def get_outcomes(agent_id: str, memory_id: str, account: str = LOCAL) -> dict:
     """Every outcome recorded for a memory, newest first, each with its signature check."""
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         _readable(memory_id, agent_id, account, "see the outcomes of")
@@ -704,7 +706,7 @@ def _words(text: str) -> set[str]:
 async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: str,
                         confidence: str | None = None, topic: str | None = None,
                         account: str = LOCAL) -> dict:
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     who = identity.principal(account, agent_id)
     memory_id = _require(memory_id, "memory_id")
     new_note = _require(new_note, "new_note")
@@ -753,7 +755,7 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
                        shared_with: list[str] | None = None, via: str | None = None,
                        account: str = LOCAL) -> dict:
     """Change who can read a memory. Only the agent that wrote it may do this."""
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
@@ -792,7 +794,7 @@ def known_agents(account: str) -> set[str]:
 async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
                         account: str = LOCAL) -> dict:
     """Delete a memory for good. Only the agent that wrote it may do this."""
-    agent_id = check_agent(agent_id, account)
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)

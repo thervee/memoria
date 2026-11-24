@@ -31,8 +31,10 @@ def test_save_answers_before_cognee_is_touched(store):
 
 def test_memories_saved_together_are_processed_in_one_run(store):
     async def scenario():
-        for note in ("Penguins huddle.", "Octopuses have three hearts.", "Owls hunt at night."):
-            await m.save_memory("alice", note, "r", "test/animals")
+        async with m._cognee_lock:  # the worker is busy, so these arrive while it waits
+            for note in ("Penguins huddle.", "Octopuses have three hearts.",
+                         "Owls hunt at night."):
+                await m.save_memory("alice", note, "r", "test/animals")
         await settle()
         assert store.count("add") == 3 and store.count("cognify") == 1
         assert all(not mem["needs_sync"] for mem in index().values())

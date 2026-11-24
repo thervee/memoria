@@ -235,14 +235,14 @@ async def _charged(account: str, agent_id: str, tool: str, work):
     """
     try:
         # (database work: in a worker thread, so other requests aren't held up)
-        charged = await asyncio.to_thread(billing.charge, account, agent_id, tool)
+        charged = await billing.in_thread(billing.charge, account, agent_id, tool)
     except billing.BillingError as e:
         raise ToolError(str(e)) from e
     try:
         result = await _run(work())
     except BaseException:
         if charged:
-            await asyncio.to_thread(billing.refund, account, agent_id, tool)
+            await billing.in_thread(billing.refund, account, agent_id, tool)
         raise
     return await _noted(account, result)
 
@@ -250,7 +250,7 @@ async def _charged(account: str, agent_id: str, tool: str, work):
 async def _noted(account: str, result):
     """Add a short "balance low" note when the account is nearly out of actions
     (on a list of memories, it goes on the first one)."""
-    note = await asyncio.to_thread(billing.low_balance_note, account)
+    note = await billing.in_thread(billing.low_balance_note, account)
     if not note:
         return result
     if isinstance(result, dict):
@@ -444,7 +444,9 @@ def _payer(ctx: Context) -> tuple[str, str]:
 
 async def _billing(action):
     try:
-        result = action()
+        # (database work: in a worker thread, so other requests aren't held up; claim_payment
+        # hands back its coroutine, which runs here and moves its own database work)
+        result = await billing.in_thread(action)
         return await result if asyncio.iscoroutine(result) else result
     except billing.BillingError as e:
         raise ToolError(str(e)) from e

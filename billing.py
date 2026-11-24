@@ -226,6 +226,15 @@ def charge(account: str, agent: str, action: str) -> bool:
 # ---------- emailing the owner when the balance runs low ----------
 
 _alert_tasks: set = set()  # keep running email tasks alive until they finish
+_loop: asyncio.AbstractEventLoop | None = None  # the server's event loop (see in_thread)
+
+
+async def in_thread(work, *args):
+    """Run billing's database work in a worker thread, so other requests aren't held up.
+    A balance email it starts is still sent in the background on this event loop."""
+    global _loop
+    _loop = asyncio.get_running_loop()
+    return await asyncio.to_thread(work, *args)
 
 
 def _balance_alerts(account: str, left: int) -> None:
@@ -256,7 +265,13 @@ def _in_background(work) -> None:
     """Run an email without making anyone wait for it."""
     try:
         loop = asyncio.get_running_loop()
-    except RuntimeError:  # e.g. manage_accounts.py: nothing else is waiting, so just send
+    except RuntimeError:
+        if _loop is not None and _loop.is_running():  # a worker thread (see in_thread)
+            future = asyncio.run_coroutine_threadsafe(work, _loop)
+            _alert_tasks.add(future)
+            future.add_done_callback(_alert_tasks.discard)
+            return
+        # e.g. manage_accounts.py: nothing else is waiting, so just send
         try:
             asyncio.run(work)
         except Exception as e:
@@ -602,7 +617,7 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
     block, transfers = await _confirmed_transfers(tx)
     of_token = [t for t in transfers if t["token"] == s["token"]]
     to_treasury = [t for t in of_token if t["to"] == s["treasury"]]
-    linked = set(wallets_of(account))
+    linked = set(await in_thread(wallets_of, account))
     mine = [t for t in to_treasury if t["from"] in linked]
     if not mine:
         if not of_token:
@@ -617,15 +632,17 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
                            "link_wallet), then claim again.")
 
     now = _now()
-    try:
+
+    def record():  # (in a worker thread, so other requests aren't held up)
         with db.transaction() as conn:
             done = {r[0] for r in conn.execute(
                 "SELECT log_index FROM payments WHERE tx_hash = ?", (tx,))}
             new = [t for t in mine if t["log_index"] not in done]
             if not new:
                 raise BillingError("This payment was already claimed.")
-            total, credits, actions, leftover, added = _record_payment(
-                conn, tx, new, account, agent, block, now)
+            return _record_payment(conn, tx, new, account, agent, block, now)
+    try:
+        total, credits, actions, leftover, added = await in_thread(record)
     except sqlite3.IntegrityError:  # claimed by another request at the same moment
         raise BillingError("This payment was already claimed.") from None
     _log_starter(account, agent, added)
@@ -635,7 +652,7 @@ async def claim(account: str, agent: str, tx_hash: str) -> dict:
     result = {"claimed": tx, "explorer": f"{EXPLORER_URL}/tx/{tx}", "tokens": _tokens(total),
               "credits": credits, "actions_added": actions,
               "leftover_tokens": _tokens(leftover),
-              "balance": balance(account, agent)}
+              "balance": await in_thread(balance, account, agent)}
     if leftover:
         result["message"] = (f"{_tokens(leftover)} $MEMORIA is kept toward your next credit: "
                              f"{_tokens(unit - leftover)} more makes 1 credit.")
@@ -796,7 +813,7 @@ async def app(scope, receive, send) -> None:
     auth = dict(scope.get("headers", [])).get(b"authorization", b"").decode(errors="replace")
     key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     try:
-        account, agent = await asyncio.to_thread(accounts.check_key, key)
+        account, agent = await in_thread(accounts.check_key, key)
     except accounts.AccountError:
         limits.failed_logins.hit(ip)
         return await answer(send, 401, error("That API key isn't valid. Check you copied all "
@@ -822,15 +839,15 @@ async def app(scope, receive, send) -> None:
     try:
         # (database work: in a worker thread, so other requests aren't held up)
         if path == "/billing/challenge":
-            result = await asyncio.to_thread(challenge, account, agent)
+            result = await in_thread(challenge, account, agent)
         elif path == "/billing/link":
-            result = await asyncio.to_thread(link_wallet, account, agent,
-                                             str(data.get("address", "")),
-                                             str(data.get("signature", "")))
+            result = await in_thread(link_wallet, account, agent,
+                                     str(data.get("address", "")),
+                                     str(data.get("signature", "")))
         elif path == "/billing/claim":
             result = await claim(account, agent, str(data.get("tx_hash", "")))
         else:
-            result = await asyncio.to_thread(balance, account, agent)
+            result = await in_thread(balance, account, agent)
     except BillingError as e:
         return await answer(send, 400, error(str(e)), cors)
     return await answer(send, 200, result, cors)
