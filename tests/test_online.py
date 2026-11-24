@@ -243,9 +243,12 @@ def test_dockerignore_shuts_out_secrets_and_data():
 
 
 def test_railway_config_checks_health():
-    config = json.loads((HERE / "railway.json").read_text())
-    assert config["build"]["builder"] == "DOCKERFILE"
-    assert config["deploy"]["healthcheckPath"] == "/health"
+    config = (HERE / ".railway" / "railway.ts").read_text()
+    assert 'builder: "DOCKERFILE"' in config
+    assert 'healthcheck: "/health"' in config and "healthcheckTimeout: 300" in config
+    assert 'restartPolicyType: "ON_FAILURE"' in config and "restartPolicyMaxRetries: 10" in config
+    assert '"/data": data' in config  # the volume with all of Memoria's data stays attached
+    assert "managed: false" in config  # variables (secrets) are never in this file
 
 
 # ---------- GitHub ----------

@@ -162,7 +162,7 @@ protect against someone who already controls Memoria and your Windows account on
 | `db.py` | Memoria's database: where memories, agents and accounts are kept |
 | `billing.py` | Paying with $MEMORIA: balances, wallet linking, claiming payments, the pay page's endpoints |
 | `paths.py` | Where data is kept (`MEMORIA_DATA_DIR`) and whether Memoria runs online (`MEMORIA_ONLINE`) |
-| `Dockerfile` / `.dockerignore` / `railway.json` | Everything Railway needs to build and run Memoria |
+| `Dockerfile` / `.dockerignore` / `.railway/railway.ts` | Everything Railway needs to build and run Memoria |
 | `requirements.txt` | Every package Memoria needs, with exact versions |
 | `requirements-dev.txt` | The extra package needed to run the tests (pytest) |
 | `tests/` | The automatic tests (`pytest.ini` holds their settings) |
@@ -288,7 +288,11 @@ Memoria runs on. It refuses anything that came through a proxy, and you can turn
    and a privacy notice (you'd be storing other people's data).
 
 ## Deploying on Railway (ready, not deployed)
-Everything Railway needs is in the repository: `Dockerfile`, `.dockerignore` and `railway.json`.
+Everything Railway needs is in the repository: `Dockerfile`, `.dockerignore` and `.railway/railway.ts`
+(Railway's infrastructure-as-code file: build from the Dockerfile, the `/health` check with a 300-second
+timeout, restart on failure up to 10 times, and the volume at `/data`; it never holds variables or
+secrets). To change these settings, edit that file, then run `npm install` once, `railway config plan`
+to preview and `railway config apply` to put them in place.
 On this laptop nothing changes: none of it is used here.
 
 **What the Docker image does**
@@ -307,7 +311,8 @@ On this laptop nothing changes: none of it is used here.
   volume, and says why in the deploy logs, so it never runs half set up and loses data.
 
 **What to set in Railway** (once)
-1. New project, then deploy this GitHub repository. Railway finds `railway.json` and builds the Dockerfile.
+1. New project, then deploy this GitHub repository. Railway builds the Dockerfile; run
+   `railway config apply` once to give it the settings in `.railway/railway.ts`.
 2. Add a **volume** to the service, mounted at **`/data`**.
 3. Add two **variables**:
    - `LLM_API_KEY`: your Gemini API key.

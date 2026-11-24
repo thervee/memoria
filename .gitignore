@@ -37,3 +37,6 @@ data/
 # Python's temporary files
 __pycache__/
 *.pyc
+
+# Railway's config tool (re-created with: npm install)
+node_modules/
