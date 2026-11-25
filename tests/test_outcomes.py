@@ -10,6 +10,7 @@ import pytest
 
 import db
 import demo
+import identity
 import memoria as m
 from memoria_client import Memoria
 
@@ -186,23 +187,40 @@ def order(agent="alice", **filters):
     return [x["note"] for x in run(m.list_memories(agent, **filters))]
 
 
-def test_successes_rank_a_little_higher_failures_a_little_lower(clock):
-    ids = {n: place(n) for n in range(1, 7)}  # newest first: 6 5 4 3 2 1
-    assert order() == [f"note {n}" for n in (6, 5, 4, 3, 2, 1)]
-    for agent in ("alice", "bob"):
-        record(agent, ids[3], "success")      # +2 net: up 2 places
-    record("alice", ids[5], "failure")         # -1 net: down 1 place
-    for agent in ("alice", "bob", "carol"):
-        record(agent, ids[2], "success")       # +3 net: capped at up 2 places
-    assert order() == ["note 6", "note 3", "note 2", "note 4", "note 5", "note 1"]
+READERS = [f"reader{n}" for n in range(1, 7)]
 
 
-def test_one_outcome_moves_a_memory_just_one_place(clock):
-    ids = {n: place(n) for n in range(1, 5)}
+def readers():
+    """Six more agents that may read every stored memory (for many outcomes on one)."""
+    for agent in READERS:
+        identity.register_agent(agent)
+    db.execute("UPDATE memories SET shared_with = ?", (json.dumps(["bob", "carol", *READERS]),))
+
+
+def test_one_or_two_outcomes_move_a_memory_only_a_little(clock):
+    ids = {n: place(n) for n in range(1, 5)}    # newest first: 4 3 2 1
     record("alice", ids[1], "success")          # the oldest, with one success
-    assert order() == ["note 4", "note 3", "note 1", "note 2"]
     record("alice", ids[4], "failure")          # the newest, with one failure
-    assert order() == ["note 3", "note 4", "note 1", "note 2"]
+    assert order() == ["note 4", "note 3", "note 2", "note 1"]  # neither is enough to move
+    record("bob", ids[3], "success")
+    record("carol", ids[3], "success")          # two successes, next to one with a failure
+    assert order() == ["note 3", "note 4", "note 2", "note 1"]
+
+
+def test_a_strong_record_moves_a_memory_further_but_not_far(clock):
+    ids = {n: place(n) for n in range(1, 7)}    # newest first: 6 5 4 3 2 1
+    readers()
+    for agent in READERS:
+        record(agent, ids[3], "success")        # 6 successes: up one place
+    assert order() == ["note 6", "note 5", "note 3", "note 4", "note 2", "note 1"]
+    for agent in READERS:
+        record(agent, ids[5], "failure")        # 6 failures: down two places
+    assert order() == ["note 6", "note 3", "note 4", "note 5", "note 2", "note 1"]
+    for agent in ("alice", "bob", "carol"):
+        record(agent, ids[1], "success")        # 9 outcomes in all: still not 2 places up
+    for agent in READERS:
+        record(agent, ids[1], "success")
+    assert order()[-2:] == ["note 1", "note 2"]
 
 
 def test_unverified_outcomes_dont_change_the_ranking(clock):
@@ -214,11 +232,12 @@ def test_unverified_outcomes_dont_change_the_ranking(clock):
 
 
 def test_find_memory_uses_the_same_ranking(clock, store):
-    a = save(note="Penguins huddle in the cold.")
-    b = save(note="Penguins huddle for warmth.")
+    a = save(note="Penguins huddle in the cold.", visibility="shared", shared_with=["bob", "carol"])
+    b = save(note="Penguins huddle for warmth.", visibility="shared", shared_with=["bob", "carol"])
     first = run(m.find_memory("alice", "penguins huddle", topic="crypto"))[0]["memory_id"]
     other = b if first == a else a
-    record("alice", other, "success")
+    for agent in ("alice", "bob", "carol"):
+        record(agent, other, "success")
     record("alice", first, "failure")
     assert run(m.find_memory("alice", "penguins huddle", topic="crypto"))[0]["memory_id"] == other
 

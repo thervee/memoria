@@ -461,6 +461,7 @@ async def find_memory(agent_id: str, query: str, topic: str | None = None,
 def _find_in_database(chunks, wanted, query, agent_id, account, topic, saved_by, limit,
                       outcome, waiting_at_start=()) -> list[dict]:
     found: list[dict] = []
+    distances: dict[str, float] = {}  # each found memory's closest passage (lower is closer)
     if chunks:
         by_data_id = db.memories_by_data_id(account, [str(c.get("document_id")) for c in chunks])
         for chunk in chunks:
@@ -470,6 +471,12 @@ def _find_in_database(chunks, wanted, query, agent_id, account, topic, saved_by,
                 mem = db.get_memory(match.group(1)) if match else None
             if mem and mem not in found and wanted(mem):
                 found.append(mem)
+            if mem and wanted(mem):
+                try:
+                    distance = float(chunk["score"])
+                except (KeyError, TypeError, ValueError):
+                    continue  # no score: ranked by its place instead
+                distances[mem["id"]] = min(distance, distances.get(mem["id"], distance))
 
     # 2. Memories still being processed aren't in Cognee's search yet (or only in their
     #    old version): find them by the words of the question instead.
@@ -496,7 +503,7 @@ def _find_in_database(chunks, wanted, query, agent_id, account, topic, saved_by,
     summaries = _summaries(found)
     if outcome:
         found = [m for m in found if _latest_result(summaries[m["id"]]) == outcome]
-    found = _ranked(found, summaries)
+    found = _ranked(found, summaries, distances)
     return [_with_outcomes(m, summaries[m["id"]]) for m in found[:limit]]
 
 
@@ -537,11 +544,19 @@ async def list_memories(agent_id: str, topic: str | None = None, saved_by: str |
 OUTCOME_RESULTS = ("success", "failure", "mixed")
 OUTCOME_FILTERS = OUTCOME_RESULTS + ("none",)
 MAX_OUTCOME_NOTE = 500
-# Ranking: each net success (successes minus failures) moves a memory up one place, each
-# net failure down one place, at most 2 places either way; on a tie the memory with the
-# better record goes first. Relevance still decides the order otherwise, and memories with
-# no outcomes don't move. Only outcomes whose signatures check out count.
-OUTCOME_STEP, OUTCOME_MAX_SHIFT = 1, 2
+# Ranking: relevance decides the order; outcomes only nudge it. A memory's record is
+#   (successes - failures) / (all its outcomes + OUTCOME_PRIOR)
+# so one or two outcomes count for little and many count for more: one success is +0.25,
+# two +0.4, ten +0.77, and it never reaches 1. Only outcomes whose signatures check out count.
+# - find_memory: the record moves a memory's search distance (lower is closer) by at most
+#   OUTCOME_DISTANCE, so outcomes reorder memories that match about equally well, but never
+#   lift a lookalike over a clearly better match.
+# - list_memories (and found memories without a search score): it moves a memory by at most
+#   OUTCOME_PLACES places. On a tie, the more relevant (or newer) memory stays first.
+# Memories with no outcomes don't move.
+OUTCOME_PRIOR = 3
+OUTCOME_DISTANCE = 0.04
+OUTCOME_PLACES = 2.0
 
 
 def _outcome_content(outcome: dict) -> bytes:
@@ -594,15 +609,33 @@ def _check_outcome_filter(outcome: str | None) -> str | None:
     return outcome
 
 
-def _ranked(memories: list[dict], summaries: dict[str, dict]) -> list[dict]:
-    """Nudge memories that helped up and ones that failed down, a little."""
-    def key(item):
+def _record(summary: dict) -> float:
+    """How well a memory's outcomes went, from -1 to 1, weighed by how many there are."""
+    good = summary["_verified"]
+    total = good["success"] + good["failure"] + good["mixed"]
+    return (good["success"] - good["failure"]) / (total + OUTCOME_PRIOR)
+
+
+def _ranked(memories: list[dict], summaries: dict[str, dict],
+            distances: dict[str, float] | None = None) -> list[dict]:
+    """Nudge memories that helped up and ones that failed down, a little (see above).
+
+    distances: each memory's search distance, for memories the search scored. Those come
+    first, as they did before ranking; the others keep their places after them."""
+    distances = distances or {}
+    scored = [m for m in memories if m["id"] in distances]
+    others = [m for m in memories if m["id"] not in distances]
+
+    def by_distance(item):
         place, mem = item
-        good = summaries[mem["id"]]["_verified"]
-        net = good["success"] - good["failure"]
-        shift = max(-OUTCOME_MAX_SHIFT, min(OUTCOME_MAX_SHIFT, OUTCOME_STEP * net))
-        return (place - shift, -net, place)
-    return [mem for _, mem in sorted(enumerate(memories), key=key)]
+        distance = distances[mem["id"]]
+        return (distance - OUTCOME_DISTANCE * _record(summaries[mem["id"]]), distance, place)
+
+    def by_place(item):
+        place, mem = item
+        return (place - OUTCOME_PLACES * _record(summaries[mem["id"]]), place)
+    return ([mem for _, mem in sorted(enumerate(scored), key=by_distance)]
+            + [mem for _, mem in sorted(enumerate(others), key=by_place)])
 
 
 def _with_outcomes(mem: dict, summary: dict) -> dict:
