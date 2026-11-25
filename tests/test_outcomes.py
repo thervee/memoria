@@ -201,9 +201,11 @@ def test_one_or_two_outcomes_move_a_memory_only_a_little(clock):
     ids = {n: place(n) for n in range(1, 5)}    # newest first: 4 3 2 1
     record("alice", ids[1], "success")          # the oldest, with one success
     record("alice", ids[4], "failure")          # the newest, with one failure
-    assert order() == ["note 4", "note 3", "note 2", "note 1"]  # neither is enough to move
+    assert order() == ["note 4", "note 3", "note 2", "note 1"]  # one outcome counts for nothing
     record("bob", ids[3], "success")
-    record("carol", ids[3], "success")          # two successes, next to one with a failure
+    record("carol", ids[3], "success")          # two successes alone aren't enough either
+    assert order() == ["note 4", "note 3", "note 2", "note 1"]
+    record("bob", ids[4], "failure")            # ...but next to one with two failures, they are
     assert order() == ["note 3", "note 4", "note 2", "note 1"]
 
 
@@ -238,7 +240,8 @@ def test_find_memory_uses_the_same_ranking(clock, store):
     other = b if first == a else a
     for agent in ("alice", "bob", "carol"):
         record(agent, other, "success")
-    record("alice", first, "failure")
+    for agent in ("alice", "bob"):
+        record(agent, first, "failure")
     assert run(m.find_memory("alice", "penguins huddle", topic="crypto"))[0]["memory_id"] == other
 
 

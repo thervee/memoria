@@ -546,8 +546,10 @@ OUTCOME_FILTERS = OUTCOME_RESULTS + ("none",)
 MAX_OUTCOME_NOTE = 500
 # Ranking: relevance decides the order; outcomes only nudge it. A memory's record is
 #   (successes - failures) / (all its outcomes + OUTCOME_PRIOR)
-# so one or two outcomes count for little and many count for more: one success is +0.25,
-# two +0.4, ten +0.77, and it never reaches 1. Only outcomes whose signatures check out count.
+# so a few outcomes count for little and many count for more: two successes are +0.4, ten
+# +0.77, and it never reaches 1. A single outcome counts for nothing (OUTCOME_MIN): one
+# success or failure, which may be luck, never moves a memory above a better match.
+# Only outcomes whose signatures check out count.
 # - find_memory: the record moves a memory's search distance (lower is closer) by at most
 #   OUTCOME_DISTANCE, so outcomes reorder memories that match about equally well, but never
 #   lift a lookalike over a clearly better match.
@@ -555,6 +557,7 @@ MAX_OUTCOME_NOTE = 500
 #   OUTCOME_PLACES places. On a tie, the more relevant (or newer) memory stays first.
 # Memories with no outcomes don't move.
 OUTCOME_PRIOR = 3
+OUTCOME_MIN = 2
 OUTCOME_DISTANCE = 0.04
 OUTCOME_PLACES = 2.0
 
@@ -613,6 +616,8 @@ def _record(summary: dict) -> float:
     """How well a memory's outcomes went, from -1 to 1, weighed by how many there are."""
     good = summary["_verified"]
     total = good["success"] + good["failure"] + good["mixed"]
+    if total < OUTCOME_MIN:
+        return 0.0
     return (good["success"] - good["failure"]) / (total + OUTCOME_PRIOR)
 
 

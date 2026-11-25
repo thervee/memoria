@@ -156,3 +156,49 @@ def test_outcomes_nudge_the_ranking_without_burying_the_best_match(scenarios, mo
     # still in the top 3.
     assert after == (4, 5)
     assert db.query("SELECT count(*) FROM outcomes")[0][0] == 11  # all were recorded
+
+
+@pytest.fixture
+def two_close_matches(store, monkeypatch):
+    """Two near-identical matches: the better one 0.200 from the question, the other 0.201."""
+    for agent in AGENTS:
+        if identity.public_key_of(agent) is None:
+            identity.register_agent(agent)
+    distance = {"Gas fees on Robinhood Chain spike at the US open.": 0.200,
+                "Gas fees on Robinhood Chain spike at the open.": 0.201}
+
+    async def search(query, query_type, datasets, top_k):
+        store._call("search")
+        hits = [{"document_id": data_id, "text": doc["text"],
+                 "score": next(d for note, d in distance.items() if note in doc["text"])}
+                for data_id, doc in store.docs.items()
+                if doc["processed"] and doc["dataset"] in datasets]
+        hits.sort(key=lambda hit: hit["score"])
+        return [{"search_result": hits}]
+    monkeypatch.setattr(store, "search", search)
+
+    async def save_both():
+        ids = []
+        for note in distance:
+            saved = await m.save_memory("alice", note, "research", "crypto",
+                                        visibility="shared", shared_with=AGENTS)
+            ids.append(saved["memory_id"])
+        await settle()
+        return ids
+    return asyncio.run(save_both())
+
+
+def first_found():
+    return asyncio.run(m.find_memory("alice", "When do gas fees spike?"))[0]["memory_id"]
+
+
+def test_one_outcome_never_lifts_a_lookalike_over_a_better_match(two_close_matches):
+    better, weaker = two_close_matches
+    assert first_found() == better
+    asyncio.run(m.record_outcome("bob", weaker, "success"))   # one success on the weaker one
+    assert first_found() == better
+    asyncio.run(m.record_outcome("bob", better, "failure"))   # and one failure on the better
+    assert first_found() == better
+    asyncio.run(m.record_outcome("carol", weaker, "success"))  # two successes: now it counts
+    asyncio.run(m.record_outcome("carol", better, "failure"))
+    assert first_found() == weaker
