@@ -36,13 +36,14 @@ import sqlite3
 import sys
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # Stop sending a memory to Cognee after this many failed tries (it stays "processing"
 # and is still found by its exact words). Saving a new version gives it fresh tries.
 SYNC_GIVE_UP = 5
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_by    TEXT,
     visibility    TEXT NOT NULL DEFAULT 'private',
     shared_with   TEXT NOT NULL DEFAULT '[]',   -- JSON list of agent IDs
+    share_expires_at TEXT,                      -- UTC time the sharing ends (none: never)
     signature     TEXT,                         -- JSON
     history       TEXT NOT NULL DEFAULT '[]',   -- JSON list of older versions
     needs_sync    INTEGER NOT NULL DEFAULT 0,   -- 1 while Cognee lacks the latest version
@@ -198,8 +200,8 @@ CREATE TABLE IF NOT EXISTS wallet_proofs (
 """
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
-                 "reason", "source", "updated_at", "updated_by", "visibility", "shared_with", "signature",
-                 "history", "needs_sync", "sync_version", "processed", "added_version",
+                 "reason", "source", "updated_at", "updated_by", "visibility", "shared_with", "share_expires_at",
+                 "signature", "history", "needs_sync", "sync_version", "processed", "added_version",
                  "data_id", "dataset_id")
 JSON_FIELDS = {"shared_with": [], "signature": None, "history": []}
 TRUE_FALSE_FIELDS = ("needs_sync", "processed")
@@ -242,6 +244,9 @@ def connection() -> sqlite3.Connection:
                 conn.execute("ALTER TABLE memories ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             if "last_error" not in memory_columns:
                 conn.execute("ALTER TABLE memories ADD COLUMN last_error TEXT")
+            # Version 8 added share expiry; older shares never expire.
+            if "share_expires_at" not in memory_columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN share_expires_at TEXT")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)
@@ -422,18 +427,25 @@ def memories_by_data_id(account: str, data_ids: list[str]) -> dict[str, dict]:
     return found
 
 
+def _utc_now() -> str:
+    """Now, written the way Memoria stores times, so the two compare as text."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def visible_memories(account: str, agent_id: str, *, waiting: bool = False,
                      topic: str | None = None, saved_by: str | None = None,
                      limit: int | None = None, topic_under: str | None = None,
                      latest_outcome: str | None = None) -> list[dict]:
-    """Memories this agent may read (its own, plus ones shared with it), newest first.
+    """Memories this agent may read (its own, plus ones shared with it whose sharing
+    hasn't expired), newest first.
 
     topic: topics containing this text. topic_under: this topic and everything under it
     ("customers" matches "customers" and "customers/acme", not "customers-old").
     """
     sql = ["SELECT * FROM memories WHERE account = ? AND (agent_id = ? OR (visibility = 'shared'"
+           " AND (share_expires_at IS NULL OR share_expires_at > ?)"
            " AND EXISTS (SELECT 1 FROM json_each(memories.shared_with) WHERE value = ?)))"]
-    params: list = [account, agent_id, agent_id]
+    params: list = [account, agent_id, _utc_now(), agent_id]
     if waiting:
         sql.append("AND needs_sync = 1")
     if topic:

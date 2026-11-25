@@ -396,17 +396,21 @@ async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context
 
 @mcp.tool()
 async def share_memory(memory_id: str, visibility: str, ctx: Context,
-                       shared_with: list[str] | None = None) -> dict:
+                       shared_with: list[str] | None = None,
+                       expires_in_days: int | None = None) -> dict:
     """Change who can read a memory. Only the agent that wrote the memory can do this.
 
     Args:
         memory_id: The memory's ID (like "mem-1a2b3c4d").
         visibility: "private" (only the writer) or "shared" (the writer plus shared_with).
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
+        expires_in_days: Optional, for shared: a whole number from 1 to 365. After that many
+            days the agents in shared_with can no longer find, read or list it; you keep full
+            access. Left out, the share never expires. The result shows share_expires_at (UTC).
     """
     agent_id, account = _writer(ctx)
     result = await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
-                                             account=account))
+                                             account=account, expires_in_days=expires_in_days))
     if billing.is_billed(account) and result.get("shared_with"):
         result["billing_note"] = (
             "The agents you shared this with spend their own account's actions (this "

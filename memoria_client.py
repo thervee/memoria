@@ -182,9 +182,10 @@ class Memoria:
         return await self._call("update_memory", memory_id=memory_id, new_note=new_note,
                                 reason=reason, confidence=confidence, topic=topic)
 
-    async def share(self, memory_id, visibility, shared_with=None) -> dict:
+    async def share(self, memory_id, visibility, shared_with=None, expires_in_days=None) -> dict:
+        extra = {} if expires_in_days is None else {"expires_in_days": expires_in_days}
         return await self._call("share_memory", memory_id=memory_id, visibility=visibility,
-                                shared_with=shared_with)
+                                shared_with=shared_with, **extra)
 
     async def delete(self, memory_id) -> dict:
         return await self._call("delete_memory", memory_id=memory_id)

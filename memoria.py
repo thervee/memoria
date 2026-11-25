@@ -48,7 +48,7 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import accounts
@@ -70,6 +70,7 @@ AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 MAX_LENGTHS = {"note": 4000, "new_note": 4000, "reason": 2000, "topic": 100, "query": 1000,
                "memory_id": 40}
 MAX_SHARED_WITH = 20
+MIN_SHARE_DAYS, MAX_SHARE_DAYS = 1, 365  # how long a share can be set to last
 
 _write_lock = asyncio.Lock()  # one change to memories at a time
 _cognee_lock = asyncio.Lock()  # held by the background worker while it changes Cognee
@@ -232,7 +233,28 @@ def can_see(mem: dict, agent_id: str, account: str = LOCAL) -> bool:
         return False
     if mem["agent_id"] == agent_id:
         return True
-    return mem.get("visibility") == "shared" and agent_id in mem.get("shared_with", [])
+    return (mem.get("visibility") == "shared" and agent_id in mem.get("shared_with", [])
+            and not share_expired(mem))
+
+
+def share_expired(mem: dict) -> bool:
+    """True once a share's expiry time has passed (shares without one never expire)."""
+    ends = mem.get("share_expires_at")
+    return bool(ends) and datetime.fromisoformat(ends) <= datetime.now(timezone.utc)
+
+
+def _check_expiry(expires_in_days) -> str | None:
+    """The UTC time a share ends, from a number of days (None: it never ends)."""
+    if expires_in_days is None:
+        return None
+    if isinstance(expires_in_days, float) and expires_in_days.is_integer():
+        expires_in_days = int(expires_in_days)
+    if (isinstance(expires_in_days, bool) or not isinstance(expires_in_days, int)
+            or not MIN_SHARE_DAYS <= expires_in_days <= MAX_SHARE_DAYS):
+        raise MemoriaError(f"expires_in_days must be a whole number from {MIN_SHARE_DAYS} "
+                           f"to {MAX_SHARE_DAYS}, or left out so the share never expires.")
+    ends = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=expires_in_days)
+    return ends.isoformat()
 
 
 def _require(value: str, name: str) -> str:
@@ -364,6 +386,8 @@ def _public(mem: dict) -> dict:
         "times_updated": len(mem.get("history", [])),
         "visibility": mem.get("visibility", "private"),
         "shared_with": mem.get("shared_with", []),
+        # When (UTC) the agents in shared_with lose access. None: the share never expires.
+        "share_expires_at": mem.get("share_expires_at"),
         # True while the background worker is still adding it to Cognee's search.
         "processing": bool(mem.get("needs_sync")),
         "signed_by": (mem.get("signature") or {}).get("signed_by"),
@@ -791,10 +815,15 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
 
 async def share_memory(agent_id: str, memory_id: str, visibility: str,
                        shared_with: list[str] | None = None, via: str | None = None,
-                       account: str = LOCAL) -> dict:
-    """Change who can read a memory. Only the agent that wrote it may do this."""
+                       account: str = LOCAL, expires_in_days: int | None = None) -> dict:
+    """Change who can read a memory. Only the agent that wrote it may do this.
+
+    expires_in_days: the agents it's shared with lose access after this many days (1 to
+    365). Left out, the share never expires. The owner always keeps access.
+    """
     agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     memory_id = _require(memory_id, "memory_id")
+    expires_at = _check_expiry(expires_in_days)
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
@@ -803,15 +832,20 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
             raise MemoriaError(
                 f"Only the agent that wrote this memory ('{mem['agent_id']}') can change its sharing."
             )
-        before = (mem.get("visibility", "private"), mem.get("shared_with", []))
+        before = (mem.get("visibility", "private"), mem.get("shared_with", []),
+                  mem.get("share_expires_at"))
         mem["visibility"], mem["shared_with"] = _check_sharing(visibility, shared_with, agent_id)
+        # A private memory has no share to end. (Not signed: sharing isn't part of the content.)
+        mem["share_expires_at"] = expires_at if mem["visibility"] == "shared" else None
         db.put_memory(mem)
         return mem, before
     async with _write_lock:
         mem, before = await asyncio.to_thread(in_database)
     _log(identity.principal(account, agent_id), "share", memory_id=memory_id,
-         before={"visibility": before[0], "shared_with": before[1]},
-         after={"visibility": mem["visibility"], "shared_with": mem["shared_with"]},
+         before={"visibility": before[0], "shared_with": before[1],
+                 "share_expires_at": before[2]},
+         after={"visibility": mem["visibility"], "shared_with": mem["shared_with"],
+                "share_expires_at": mem["share_expires_at"]},
          **({"via": via} if via else {}))
     out = _public(mem)
     unknown = [a for a in mem["shared_with"] if a not in known_agents(account)]
