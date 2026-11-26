@@ -42,6 +42,8 @@ It opens straight away, with no password, and runs whenever Memoria runs.
 | `delete_memory` | Deletes a memory for good, with its history (only the agent that wrote it can do this; agents it's shared with can't) |
 | `record_outcome` | Records whether a memory helped: `success`, `failure` or `mixed`, with an optional note (up to 500 characters). Any agent that can read the memory can record one; recording again replaces your earlier one. Signed, and free |
 | `get_outcomes` | Every outcome recorded for a memory, newest first, each with its signature check |
+| `export_memories` | Downloads every memory you wrote (optionally one topic) as one signed JSON file |
+| `restore_memories` | Loads an export file back into your account, after checking every signature |
 
 Every memory is labelled with: the agent ID that wrote it, when it was saved or updated, its topic and its confidence.
 
@@ -58,7 +60,8 @@ Memoria can be paid for with the $MEMORIA token on Robinhood Chain (see `billing
 until `MEMORIA_BILLING=on`; with it off, nothing changes and the payment tools aren't offered.
 
 - **Price:** 1 credit = 10,000 $MEMORIA = 2 actions. Balances are kept in actions.
-- **What costs 1 action:** `save_memory`, `update_memory`, `find_memory`, `list_memories` and `get_outcomes`.
+- **What costs 1 action:** `save_memory`, `update_memory`, `find_memory`, `list_memories`, `get_outcomes`
+  and `export_memories`; `restore_memories` costs 1 action per memory restored.
   **Free:** `record_outcome`, `share_memory`, `delete_memory`, `get_balance`, `wallet_challenge`,
   `link_wallet` and `claim_payment`. A failed action is given back. With 4 actions or fewer left,
   every tool's result carries a short "balance low" note with the pay page link.
@@ -136,6 +139,28 @@ Every memory is either:
 - **shared**: the writer plus the agent IDs listed in `shared_with`, e.g. `["trader"]`.
 
 Agents only ever see memories they're allowed to read. Anything else acts as if it doesn't exist.
+
+## Export and restore
+`export_memories` returns one JSON file with every memory the calling agent wrote (or, with `topic`,
+that topic and everything under it). Each memory comes with its note, reason, topic, source,
+confidence, outcomes, edit history, times (UTC) and its own signature, so each still verifies.
+The whole file is also signed by the exporting agent, so anyone can check nothing was added,
+removed or changed. Memories shared with you by other agents are never included, and neither are
+sharing settings, keys or secrets.
+
+`restore_memories` takes that file (or its JSON text) and loads it into the caller's account, the
+same account or a new one:
+- The file's signature and every memory's signature are checked first. A changed file is refused
+  as a whole; a memory that fails its own check is refused and listed with the reason.
+- Memories the account already has, or restored before, are skipped, so restoring twice adds nothing.
+- Restored memories belong to the restoring agent and are **private**: old sharing isn't carried over.
+  Restored into the same agent and account, a memory comes back exactly as it was, with its original
+  ID and signature. Otherwise it's re-signed by the restoring agent and shows `restored_from`.
+- Each memory restored counts toward the account's memory limit and daily writes, and costs 1 action
+  like `save_memory`; skipped and refused ones are free. When the limit (or the balance) runs out,
+  the rest are listed under `not_restored`.
+- Outcomes stay in the file but aren't restored. A request can be 64 KB at most, so export big
+  collections one topic at a time.
 
 ## Signatures
 Every saved or updated memory is signed with the secret key of the agent that wrote that version.

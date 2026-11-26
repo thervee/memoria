@@ -390,6 +390,8 @@ def _public(mem: dict) -> dict:
         "share_expires_at": mem.get("share_expires_at"),
         # True while the background worker is still adding it to Cognee's search.
         "processing": bool(mem.get("needs_sync")),
+        # For a memory loaded with restore_memories: the exported memory it came from.
+        **({"restored_from": mem["restored_from"]} if mem.get("restored_from") else {}),
         "signed_by": (mem.get("signature") or {}).get("signed_by"),
         "public_key": (mem.get("signature") or {}).get("public_key"),
     }
@@ -1052,6 +1054,233 @@ async def _work_once() -> bool:
 def all_memories() -> list[dict]:
     """Every memory with its labels and signature check, newest first."""
     return [_public(m) for m in db.all_memories()]
+
+
+# ---------- export and restore ----------
+
+EXPORT_FORMAT = "memoria-export-v1"
+# What the export file's signature covers (any other keys in the file are ignored).
+EXPORT_SIGNED_KEYS = ("format", "exported_at", "exported_by", "topic", "memory_count", "memories")
+# Each exported memory: its content, labels, edit history and signature. No sharing
+# settings and nothing internal (Cognee IDs and the like).
+EXPORT_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
+                 "reason", "source", "updated_at", "updated_by", "history", "signature")
+OUTCOME_EXPORT_FIELDS = ("agent_id", "result", "note", "recorded_at", "signature")
+MAX_RESTORE = 1000  # memories in one export file
+
+
+def _export_content(export: dict) -> bytes:
+    """The exact bytes an export file's signature covers."""
+    content = {key: export.get(key) for key in EXPORT_SIGNED_KEYS}
+    return (EXPORT_FORMAT + "|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
+                                             separators=(",", ":"))).encode("utf-8")
+
+
+async def export_memories(agent_id: str, topic: str | None = None,
+                          account: str = LOCAL) -> dict:
+    """Every memory this agent wrote (optionally only one topic and those under it), as
+    one signed export file. Memories shared with it by others are never included."""
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
+    topic = (topic or "").strip() or None
+    who = identity.principal(account, agent_id)
+
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
+        mine = [mem for mem in db.visible_memories(account, agent_id, topic_under=topic,
+                                                   saved_by=agent_id)
+                if mem["agent_id"] == agent_id and account_of(mem) == account]
+        outcomes = db.outcomes_for([mem["id"] for mem in mine])
+        return [{**{field: mem[field] for field in EXPORT_FIELDS if field in mem},
+                 "outcomes": [{field: o.get(field) for field in OUTCOME_EXPORT_FIELDS}
+                              for o in outcomes.get(mem["id"], [])]}
+                for mem in mine]
+    memories = await asyncio.to_thread(in_database)
+    export = {"format": EXPORT_FORMAT, "exported_at": _now(),
+              "exported_by": {"account": account, "agent_id": agent_id},
+              "topic": topic, "memory_count": len(memories), "memories": memories}
+    try:
+        export["signature"] = identity.sign(who, _export_content(export))
+    except identity.IdentityError as e:
+        raise MemoriaError(str(e)) from e
+    _log(who, "export", memories=len(memories), **({"topic": topic} if topic else {}))
+    return export
+
+
+def _read_export(export) -> dict:
+    """The export file as a dict, with the basic shape checked."""
+    if isinstance(export, str):
+        try:
+            export = json.loads(export)
+        except ValueError:
+            raise MemoriaError("The export file isn't valid JSON.") from None
+    if not isinstance(export, dict) or export.get("format") != EXPORT_FORMAT:
+        raise MemoriaError(f"That isn't a Memoria export file (format '{EXPORT_FORMAT}').")
+    by = export.get("exported_by")
+    memories = export.get("memories")
+    if (not isinstance(by, dict) or not isinstance(by.get("account"), str)
+            or not isinstance(by.get("agent_id"), str) or not isinstance(memories, list)
+            or not all(isinstance(mem, dict) for mem in memories)):
+        raise MemoriaError("The export file is incomplete: it needs exported_by and memories.")
+    if len(memories) > MAX_RESTORE:
+        raise MemoriaError(f"An export file can hold {MAX_RESTORE:,} memories at most. "
+                           "Export one topic at a time to make smaller files.")
+    return export
+
+
+def _check_exported_memory(mem: dict, account: str, agent: str) -> str | None:
+    """Why this exported memory can't be restored, or None if it's fine."""
+    if not isinstance(mem.get("id"), str) or not mem["id"].startswith("mem-"):
+        return "it has no valid memory ID"
+    if mem.get("agent_id") != agent or account_of(mem) != account:
+        return "it wasn't written by the agent that made the export"
+    if (mem.get("updated_by") or agent) != agent:
+        return "its latest version wasn't signed by its author"
+    signer = identity.principal(account, agent)
+    ok, detail, _ = identity.verify_anywhere(_signed_content(mem), mem.get("signature"), signer)
+    if not ok:
+        return f"its signature doesn't check out: {detail}"
+    try:  # (the same rules a save follows; a signed memory from Memoria always passes)
+        for name in ("note", "reason", "topic"):
+            if _require(mem.get(name) or "", name) != mem.get(name):
+                return f"its {name} isn't valid"
+        if _check_confidence(mem.get("confidence") or "") != mem.get("confidence"):
+            return "its confidence isn't valid"
+        if mem.get("source") is not None and _check_source(mem["source"]) != mem["source"]:
+            return "its source isn't valid"
+        _when(mem.get("created_at"))
+        if mem.get("updated_at") is not None:
+            _when(mem["updated_at"])
+        history = mem.get("history", [])
+        if not isinstance(history, list) or not all(
+                isinstance(old, dict) and all(isinstance(old.get(key), str) for key in (
+                    "note", "reason", "confidence", "topic", "replaced_by", "replaced_at"))
+                for old in history):
+            return "its edit history isn't valid"
+    except (MemoriaError, TypeError, ValueError, AttributeError):
+        return "some of its fields aren't valid"
+    return None
+
+
+def _when(text) -> None:
+    """Refuse a time that isn't a proper UTC time."""
+    if datetime.fromisoformat(text).utcoffset() != timedelta(0):
+        raise ValueError("not UTC")
+
+
+async def restore_memories(agent_id: str, export, account: str = LOCAL,
+                           pay=None, refund=None) -> dict:
+    """Load an export file's memories into this agent's account, as this agent's own.
+
+    The file's signature and every memory's signature are checked first. A file that
+    was changed is refused as a whole; a memory whose own signature fails is refused
+    and listed. Memories the account already has (or restored before) are skipped.
+    Restored memories are private: the old sharing isn't carried over. Outcomes stay in
+    the file but aren't restored (they were recorded by the old account's agents).
+
+    pay(): called (in a worker thread) before each memory is restored; may raise
+    ValueError when the balance is empty, which stops the restore. refund(): gives back
+    one payment when a memory then can't be restored (e.g. the account is full).
+    """
+    agent_id = await asyncio.to_thread(check_agent, agent_id, account)
+    who = identity.principal(account, agent_id)
+    export = _read_export(export)
+    from_account = export["exported_by"]["account"]
+    from_agent = export["exported_by"]["agent_id"]
+    exporter = identity.principal(from_account, from_agent)
+
+    def check():  # (up to MAX_RESTORE signatures: in a worker thread, like database work)
+        checked = identity.verify_anywhere(_export_content(export), export.get("signature"),
+                                           exporter)
+        problems = {}
+        for mem in export["memories"]:
+            why = _check_exported_memory(mem, from_account, from_agent)
+            if why:
+                problems[str(mem.get("id"))] = why
+        return (*checked, problems)
+    file_ok, file_detail, known, problems = await asyncio.to_thread(check)
+    if not file_ok:
+        listed = "; ".join(f"{mid}: {why}" for mid, why in problems.items())
+        raise MemoriaError(
+            f"The export file was changed after it was signed ({file_detail}), so nothing "
+            "was restored." + (f" Memories that fail their own check: {listed}." if listed
+                               else " Every memory's own signature checks out, so a memory "
+                                    "may have been added or removed."))
+    same_owner = (from_account, from_agent) == (account, agent_id)
+
+    def in_database():  # (run in a worker thread, so other requests aren't held up)
+        restored, skipped, stopped = [], [], []
+        for number, original in enumerate(export["memories"]):
+            original_id = str(original.get("id"))
+            if original_id in problems:
+                continue
+            if db.already_restored(account, original_id):
+                skipped.append(original_id)
+                continue
+            if pay is not None:
+                try:
+                    paid = pay()
+                except ValueError as e:  # out of actions: stop here
+                    stopped = [m.get("id") for m in export["memories"][number:]
+                               if str(m.get("id")) not in problems
+                               and not db.already_restored(account, str(m.get("id")))]
+                    stopped = [{"memory_id": mid, "why": str(e)} for mid in stopped]
+                    break
+            else:
+                paid = False
+            try:
+                _use_quota(account, new_memory=True)
+            except MemoriaError as e:  # the account's limit: stop here
+                if paid and refund is not None:
+                    refund()
+                stopped = [{"memory_id": m.get("id"), "why": str(e)}
+                           for m in export["memories"][number:]
+                           if str(m.get("id")) not in problems
+                           and not db.already_restored(account, str(m.get("id")))]
+                break
+            mem = {field: original[field] for field in EXPORT_FIELDS if field in original}
+            mem.update(visibility="private", shared_with=[])  # old shares don't carry over
+            if not (same_owner and db.add_memory({**mem})):
+                # A copy owned by this agent: re-signed by it (its account and author changed,
+                # or the ID is taken), noting which memory it came from.
+                mem.update(account=account, agent_id=agent_id, restored_from=original_id)
+                if mem.get("updated_by"):
+                    mem["updated_by"] = agent_id
+                if db.get_memory(mem["id"]) is not None:
+                    mem["id"] = _new_memory_id()
+                for _ in range(SAVE_ATTEMPTS):
+                    _sign(mem, who)
+                    _mark_changed(mem)
+                    if db.add_memory(mem):
+                        break
+                    mem["id"] = _new_memory_id()
+                else:
+                    if paid and refund is not None:
+                        refund()
+                    stopped.append({"memory_id": original_id,
+                                    "why": "it couldn't be saved just now; try again"})
+                    continue
+            else:  # the very same memory, back where it was: its own signature still holds
+                _mark_changed(mem)
+                db.put_memory(mem)
+            restored.append({"memory_id": mem["id"], "restored_from": original_id})
+        return restored, skipped, stopped
+
+    async with _write_lock:
+        restored, skipped, stopped = await asyncio.to_thread(in_database)
+    _log(who, "restore", restored=len(restored), skipped=len(skipped), refused=len(problems),
+         not_restored=len(stopped), exported_by=exporter)
+    if restored:
+        _kick()  # the background worker adds them to search
+    return {
+        "restored_count": len(restored),
+        "restored": restored,
+        "skipped_already_here": skipped,
+        "refused": [{"memory_id": mid, "why": why} for mid, why in problems.items()],
+        "not_restored": stopped,
+        "file_verification": f"verified: {file_detail}",
+        "signer_known_here": known,
+        "note": ("Restored memories are private to you; share them again with share_memory "
+                 "if needed. Outcomes stay in the export file but aren't restored."),
+    }
 
 
 def memory_versions(memory_id: str) -> dict | None:

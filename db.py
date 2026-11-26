@@ -43,7 +43,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # Stop sending a memory to Cognee after this many failed tries (it stays "processing"
 # and is still found by its exact words). Saving a new version gives it fresh tries.
 SYNC_GIVE_UP = 5
@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS memories (
     data_id       TEXT,                         -- where Cognee keeps it
     dataset_id    TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,   -- failed tries at sending this version to Cognee
-    last_error    TEXT                          -- why the last try failed
+    last_error    TEXT,                         -- why the last try failed
+    restored_from TEXT                          -- for a restored copy: the exported memory's ID
 );
 CREATE INDEX IF NOT EXISTS memories_by_owner ON memories(account, agent_id);
 CREATE INDEX IF NOT EXISTS memories_waiting ON memories(needs_sync) WHERE needs_sync = 1;
@@ -201,7 +202,7 @@ CREATE TABLE IF NOT EXISTS wallet_proofs (
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
                  "reason", "source", "updated_at", "updated_by", "visibility", "shared_with", "share_expires_at",
-                 "signature", "history", "needs_sync", "sync_version", "processed", "added_version",
+                 "signature", "history", "restored_from", "needs_sync", "sync_version", "processed", "added_version",
                  "data_id", "dataset_id")
 JSON_FIELDS = {"shared_with": [], "signature": None, "history": []}
 TRUE_FALSE_FIELDS = ("needs_sync", "processed")
@@ -247,6 +248,9 @@ def connection() -> sqlite3.Connection:
             # Version 8 added share expiry; older shares never expire.
             if "share_expires_at" not in memory_columns:
                 conn.execute("ALTER TABLE memories ADD COLUMN share_expires_at TEXT")
+            # Version 9 records where a restored memory came from (restore_memories).
+            if "restored_from" not in memory_columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN restored_from TEXT")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)
@@ -403,6 +407,12 @@ def outcomes_for(memory_ids: list[str]) -> dict[str, list[dict]]:
                          part):
             found.setdefault(row["memory_id"], []).append(_to_outcome(row))
     return found
+
+
+def already_restored(account: str, memory_id: str) -> bool:
+    """True if this account has the memory, or a restored copy of it, already."""
+    return bool(query("SELECT 1 FROM memories WHERE account = ? AND (id = ? OR restored_from = ?) "
+                      "LIMIT 1", (account, memory_id, memory_id)))
 
 
 def count_memories(account: str) -> int:

@@ -434,7 +434,8 @@ def test_billing_off_changes_nothing(store, devs, memoria_url):
     assert billing.enabled() is False
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
     assert names == {"save_memory", "find_memory", "list_memories", "update_memory",
-                     "share_memory", "delete_memory", "record_outcome", "get_outcomes"}
+                     "share_memory", "delete_memory", "record_outcome", "get_outcomes",
+                     "export_memories", "restore_memories"}
 
     async def work(mem):
         await mem.save("Free.", reason="r", topic="t")
@@ -800,7 +801,8 @@ def test_free_payment_tools_use_no_actions(on, billing_url):
     costs = run_as(on["acme/trader"], billing_url, work)
     assert actions() == 20
     assert costs == {"1 action each": ["save_memory", "update_memory", "find_memory",
-                                       "list_memories", "get_outcomes"],
+                                       "list_memories", "get_outcomes", "export_memories",
+                                       "restore_memories"],
                      "free": ["record_outcome", "share_memory", "delete_memory", "get_balance",
                               "wallet_challenge", "link_wallet", "claim_payment"]}
 

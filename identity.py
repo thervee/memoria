@@ -318,3 +318,27 @@ def verify(message: bytes, sig: dict | None, expected_signer: str) -> tuple[bool
     except (InvalidSignature, ValueError):
         return False, "the memory was changed after it was signed"
     return True, f"signed by {expected_signer}"
+
+
+def verify_anywhere(message: bytes, sig: dict | None,
+                    expected_signer: str) -> tuple[bool, str, bool]:
+    """Like verify(), for data that may come from another Memoria (an export file).
+
+    If the signer is registered here, its registered key must have signed it. If not,
+    the signature is checked against the public key stored with it: that proves the data
+    wasn't changed after that key signed it, but not who holds the key.
+    Returns (ok, short explanation, signer is registered here).
+    """
+    if public_key_of(expected_signer) is not None:
+        return (*verify(message, sig, expected_signer), True)
+    if not sig:
+        return False, "no signature", False
+    if sig.get("signed_by") != expected_signer:
+        return False, f"signed by '{sig.get('signed_by')}', not '{expected_signer}'", False
+    try:
+        Ed25519PublicKey.from_public_bytes(_unb64(sig.get("public_key", ""))).verify(
+            _unb64(sig.get("signature", "")), message)
+    except (InvalidSignature, ValueError):
+        return False, "it was changed after it was signed", False
+    return True, (f"signed by {expected_signer} (not an agent on this server, so checked "
+                  "against the public key in the file)"), False

@@ -51,7 +51,8 @@ def every_tool_url(on):
     mcp = MCPServer("memoria-test")
     for tool in (server.save_memory, server.find_memory, server.list_memories,
                  server.record_outcome, server.get_outcomes, server.update_memory,
-                 server.share_memory, server.delete_memory):
+                 server.share_memory, server.delete_memory, server.export_memories,
+                 server.restore_memories):
         mcp.tool()(tool)
     server.add_billing_tools(mcp)
     port = free_port()
@@ -78,6 +79,8 @@ def test_no_tool_touches_the_database_on_the_event_loop(on, chain, every_tool_ur
             await mem.outcomes(saved["memory_id"])
             await mem.update(saved["memory_id"], "Acme renews March 2.", reason="moved")
             await mem.share(saved["memory_id"], "shared", ["analyst"])
+            export = await mem.export()
+            await mem.restore(export)
             message = (await mem.wallet_challenge())["message"]
             signature = Account.sign_message(encode_defunct(text=message),
                                              wallet.key).signature.hex()

@@ -192,3 +192,9 @@ class Memoria:
 
     async def delete(self, memory_id) -> dict:
         return await self._call("delete_memory", memory_id=memory_id)
+
+    async def export(self, topic=None) -> dict:
+        return await self._call("export_memories", topic=topic)
+
+    async def restore(self, export) -> dict:
+        return await self._call("restore_memories", export=export)

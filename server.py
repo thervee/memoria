@@ -31,6 +31,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -430,6 +431,47 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
             "The agents you shared this with spend their own account's actions (this "
             "account's balance, since all its agents share one) when they find or list it: "
             "1 action each time.")
+    return await _noted(account, result)
+
+
+@mcp.tool()
+async def export_memories(ctx: Context, topic: str | None = None) -> dict:
+    """Download every memory you wrote as one signed export file (JSON), to keep or to
+    load back later with restore_memories.
+
+    Each memory comes with its note, reason, topic, source, confidence, outcomes, edit
+    history, times (UTC) and its signature, and the whole file is signed by you, so
+    anyone can check nothing was added, removed or changed. Memories shared with you by
+    other agents are not included, and no keys or secrets are.
+
+    Args:
+        topic: Optional: only this topic and the topics under it, e.g. "customers".
+    """
+    agent_id, account = _writer(ctx)
+    return await _charged(account, agent_id, "export_memories", lambda: memoria.export_memories(
+        agent_id, topic, account=account))
+
+
+@mcp.tool()
+async def restore_memories(export: dict[str, Any] | str, ctx: Context) -> dict:
+    """Load the memories in an export file (from export_memories) into your account.
+
+    The file's signature and every memory's signature are checked first: a file that
+    was changed is refused, and any memory that fails its own check is listed and not
+    restored. Memories already in your account (or restored before) are skipped, so
+    restoring twice adds nothing. Restored memories are yours and private: old sharing
+    isn't carried over. Each memory restored counts toward your account's memory limit
+    and uses 1 action, like save_memory; skipped or refused ones are free.
+
+    Args:
+        export: The export file, as returned by export_memories (or its JSON text).
+    """
+    agent_id, account = _writer(ctx)
+    billed = await billing.in_thread(billing.is_billed, account)
+    pay = (lambda: billing.charge(account, agent_id, "restore_memories")) if billed else None
+    refund = (lambda: billing.refund(account, agent_id, "restore_memories")) if billed else None
+    result = await _run(memoria.restore_memories(agent_id, export, account=account,
+                                                 pay=pay, refund=refund))
     return await _noted(account, result)
 
 

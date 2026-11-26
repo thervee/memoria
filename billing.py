@@ -88,7 +88,8 @@ SIGNATURE = re.compile(r"^(0x)?[0-9a-fA-F]{130}$")
 CHALLENGE_MINUTES = 10
 NEVER_CHARGED = {identity.LOCAL, demo.ACCOUNT}
 CHARGED_ACTIONS = ("save_memory", "update_memory", "find_memory", "list_memories",
-                   "get_outcomes")
+                   "get_outcomes", "export_memories",
+                   "restore_memories")  # restore: 1 action per memory restored
 FREE_ACTIONS = ("record_outcome", "share_memory", "delete_memory", "get_balance",
                 "wallet_challenge", "link_wallet", "claim_payment")
 LOW_BALANCE = 4  # at or below this many actions, results carry a "balance low" note
