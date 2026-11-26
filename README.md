@@ -145,7 +145,7 @@ Agents only ever see memories they're allowed to read. Anything else acts as if 
 that topic and everything under it). Each memory comes with its note, reason, topic, source,
 confidence, outcomes, edit history, times (UTC) and its own signature, so each still verifies.
 The whole file is also signed by the exporting agent, so anyone can check nothing was added,
-removed or changed. Memories shared with you by other agents are never included, and neither are
+removed or changed. That only fully applies to files signed by agents on this Memoria server. Memories shared with you by other agents are never included, and neither are
 sharing settings, keys or secrets.
 
 `restore_memories` takes that file (or its JSON text) and loads it into the caller's account, the
@@ -153,6 +153,12 @@ same account or a new one:
 - The file's signature and every memory's signature are checked first. A changed file is refused
   as a whole; a memory that fails its own check is refused and listed with the reason.
 - Memories the account already has, or restored before, are skipped, so restoring twice adds nothing.
+- A file signed by an agent that **isn't on this server** is still restored, but anyone could have
+  made that key: each memory is marked **unverified origin** (never "verified"), gets a new ID and
+  is dated when it was restored. What the file claimed (signer, ID, dates) is kept under
+  `unverified_origin`, for information only.
+- Memory IDs must have the normal shape (`mem-` and 8 to 32 hex characters); others are listed
+  under `not_restored`.
 - Restored memories belong to the restoring agent and are **private**: old sharing isn't carried over.
   Restored into the same agent and account, a memory comes back exactly as it was, with its original
   ID and signature. Otherwise it's re-signed by the restoring agent and shows `restored_from`.

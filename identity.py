@@ -301,12 +301,14 @@ def sign(agent_id: str, message: bytes) -> dict:
     }
 
 
-def verify(message: bytes, sig: dict | None, expected_signer: str) -> tuple[bool, str]:
-    """Check a stored signature. Returns (ok, short explanation)."""
+def verify(message: bytes, sig: dict | None, expected_signer: str,
+           what: str = "the memory") -> tuple[bool, str]:
+    """Check a stored signature. Returns (ok, short explanation).
+    `what` names what was signed in the explanation ("the memory", "this file")."""
     if not sig:
         return False, "no signature (saved before signing was added)"
     if sig.get("signed_by") != expected_signer:
-        return False, f"signed by '{sig.get('signed_by')}', but the memory says '{expected_signer}' wrote it"
+        return False, f"signed by '{sig.get('signed_by')}', but {what} says '{expected_signer}' wrote it"
     registered = public_key_of(expected_signer)
     if registered is None:
         return False, f"'{expected_signer}' is not a registered agent"
@@ -316,21 +318,22 @@ def verify(message: bytes, sig: dict | None, expected_signer: str) -> tuple[bool
         Ed25519PublicKey.from_public_bytes(_unb64(registered)).verify(
             _unb64(sig.get("signature", "")), message)
     except (InvalidSignature, ValueError):
-        return False, "the memory was changed after it was signed"
+        return False, f"{what} was changed after it was signed"
     return True, f"signed by {expected_signer}"
 
 
-def verify_anywhere(message: bytes, sig: dict | None,
-                    expected_signer: str) -> tuple[bool, str, bool]:
+def verify_anywhere(message: bytes, sig: dict | None, expected_signer: str,
+                    what: str = "the memory") -> tuple[bool, str, bool]:
     """Like verify(), for data that may come from another Memoria (an export file).
 
     If the signer is registered here, its registered key must have signed it. If not,
-    the signature is checked against the public key stored with it: that proves the data
-    wasn't changed after that key signed it, but not who holds the key.
+    the signature can only be checked against the public key stored with it. Anyone can
+    make a key and sign with it, so that proves nothing about who wrote it: the result
+    is then never "verified" but "unverified origin" (ok means only that it's intact).
     Returns (ok, short explanation, signer is registered here).
     """
     if public_key_of(expected_signer) is not None:
-        return (*verify(message, sig, expected_signer), True)
+        return (*verify(message, sig, expected_signer, what), True)
     if not sig:
         return False, "no signature", False
     if sig.get("signed_by") != expected_signer:
@@ -339,6 +342,6 @@ def verify_anywhere(message: bytes, sig: dict | None,
         Ed25519PublicKey.from_public_bytes(_unb64(sig.get("public_key", ""))).verify(
             _unb64(sig.get("signature", "")), message)
     except (InvalidSignature, ValueError):
-        return False, "it was changed after it was signed", False
-    return True, (f"signed by {expected_signer} (not an agent on this server, so checked "
-                  "against the public key in the file)"), False
+        return False, f"{what} was changed after it was signed", False
+    return True, (f"unverified origin: '{expected_signer}' isn't an agent on this server, so "
+                  "who signed it can't be checked (only the file's own key matches)"), False

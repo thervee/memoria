@@ -460,7 +460,9 @@ async def restore_memories(export: dict[str, Any] | str, ctx: Context) -> dict:
     was changed is refused, and any memory that fails its own check is listed and not
     restored. Memories already in your account (or restored before) are skipped, so
     restoring twice adds nothing. Restored memories are yours and private: old sharing
-    isn't carried over. Each memory restored counts toward your account's memory limit
+    isn't carried over. A file signed by an agent that isn't on this server is still
+    restored, but its memories are marked "unverified origin", get new IDs and are dated
+    when restored (the file's dates are kept only as what it claimed). Each memory restored counts toward your account's memory limit
     and uses 1 action, like save_memory; skipped or refused ones are free.
 
     Args:

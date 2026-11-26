@@ -43,7 +43,7 @@ import paths
 
 HERE = Path(__file__).resolve().parent
 DB_FILE = paths.STORE / "memoria.db"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # Stop sending a memory to Cognee after this many failed tries (it stays "processing"
 # and is still found by its exact words). Saving a new version gives it fresh tries.
 SYNC_GIVE_UP = 5
@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS memories (
     dataset_id    TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,   -- failed tries at sending this version to Cognee
     last_error    TEXT,                         -- why the last try failed
-    restored_from TEXT                          -- for a restored copy: the exported memory's ID
+    restored_from TEXT,                         -- for a restored copy: the exported memory's ID
+    unverified_origin TEXT                      -- JSON: restored from a file signed by an agent
+                                                -- not on this server (what the file claimed)
 );
 CREATE INDEX IF NOT EXISTS memories_by_owner ON memories(account, agent_id);
 CREATE INDEX IF NOT EXISTS memories_waiting ON memories(needs_sync) WHERE needs_sync = 1;
@@ -202,9 +204,9 @@ CREATE TABLE IF NOT EXISTS wallet_proofs (
 
 MEMORY_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
                  "reason", "source", "updated_at", "updated_by", "visibility", "shared_with", "share_expires_at",
-                 "signature", "history", "restored_from", "needs_sync", "sync_version", "processed", "added_version",
+                 "signature", "history", "restored_from", "unverified_origin", "needs_sync", "sync_version", "processed", "added_version",
                  "data_id", "dataset_id")
-JSON_FIELDS = {"shared_with": [], "signature": None, "history": []}
+JSON_FIELDS = {"shared_with": [], "signature": None, "history": [], "unverified_origin": None}
 TRUE_FALSE_FIELDS = ("needs_sync", "processed")
 
 # One connection per process, used by one thread at a time.
@@ -251,6 +253,9 @@ def connection() -> sqlite3.Connection:
             # Version 9 records where a restored memory came from (restore_memories).
             if "restored_from" not in memory_columns:
                 conn.execute("ALTER TABLE memories ADD COLUMN restored_from TEXT")
+            # Version 10 marks memories restored from files signed by agents not on this server.
+            if "unverified_origin" not in memory_columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN unverified_origin TEXT")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             _import_json_files(conn, DB_FILE.parent)
             _state.update(path=DB_FILE, conn=conn)

@@ -352,6 +352,13 @@ def _sign(mem: dict, agent_id: str) -> None:
 
 def _verification(mem: dict) -> dict:
     """Check the memory's signature right now."""
+    origin = mem.get("unverified_origin")
+    if origin:  # restored from a file nobody on this server signed: never "verified"
+        return {"verification": "NOT verified",
+                "verification_detail": (
+                    f"unverified origin: restored from a file signed by '{origin.get('signed_by')}', "
+                    "which isn't an agent on this server, so who wrote it can't be checked"),
+                "signed_by_author": False}
     expected = identity.principal(account_of(mem), mem.get("updated_by") or mem["agent_id"])
     ok, detail = identity.verify(_signed_content(mem), mem.get("signature"), expected)
     by_author = ok and (mem.get("updated_by") or mem["agent_id"]) == mem["agent_id"]
@@ -392,6 +399,10 @@ def _public(mem: dict) -> dict:
         "processing": bool(mem.get("needs_sync")),
         # For a memory loaded with restore_memories: the exported memory it came from.
         **({"restored_from": mem["restored_from"]} if mem.get("restored_from") else {}),
+        # For a memory restored from a file signed by an agent not on this server: what the
+        # file claimed (its signer and dates). Information only: none of it can be checked.
+        **({"unverified_origin": mem["unverified_origin"]} if mem.get("unverified_origin")
+           else {}),
         "signed_by": (mem.get("signature") or {}).get("signed_by"),
         "public_key": (mem.get("signature") or {}).get("public_key"),
     }
@@ -1067,6 +1078,7 @@ EXPORT_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence
                  "reason", "source", "updated_at", "updated_by", "history", "signature")
 OUTCOME_EXPORT_FIELDS = ("agent_id", "result", "note", "recorded_at", "signature")
 MAX_RESTORE = 1000  # memories in one export file
+MEMORY_ID_SHAPE = re.compile(r"^mem-[0-9a-f]{8,32}$")  # (older IDs have 8 hex characters)
 
 
 def _export_content(export: dict) -> bytes:
@@ -1128,8 +1140,6 @@ def _read_export(export) -> dict:
 
 def _check_exported_memory(mem: dict, account: str, agent: str) -> str | None:
     """Why this exported memory can't be restored, or None if it's fine."""
-    if not isinstance(mem.get("id"), str) or not mem["id"].startswith("mem-"):
-        return "it has no valid memory ID"
     if mem.get("agent_id") != agent or account_of(mem) != account:
         return "it wasn't written by the agent that made the export"
     if (mem.get("updated_by") or agent) != agent:
@@ -1175,6 +1185,9 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
     and listed. Memories the account already has (or restored before) are skipped.
     Restored memories are private: the old sharing isn't carried over. Outcomes stay in
     the file but aren't restored (they were recorded by the old account's agents).
+    A file signed by an agent that isn't on this server is still restored, but each memory
+    gets a new ID, the restore time as its date and is marked "unverified origin" (never
+    "verified"). Memory IDs that aren't the normal shape are listed under not_restored.
 
     pay(): called (in a worker thread) before each memory is restored; may raise
     ValueError when the balance is empty, which stops the restore. refund(): gives back
@@ -1189,28 +1202,34 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
 
     def check():  # (up to MAX_RESTORE signatures: in a worker thread, like database work)
         checked = identity.verify_anywhere(_export_content(export), export.get("signature"),
-                                           exporter)
-        problems = {}
+                                           exporter, what="this file")
+        problems, bad_ids = {}, {}
         for mem in export["memories"]:
+            mid = str(mem.get("id"))
+            if not isinstance(mem.get("id"), str) or not MEMORY_ID_SHAPE.match(mem["id"]):
+                bad_ids[mid] = ("its memory ID isn't valid: IDs are 'mem-' and 8 to 32 "
+                                "lowercase hex characters")
+                continue
             why = _check_exported_memory(mem, from_account, from_agent)
             if why:
-                problems[str(mem.get("id"))] = why
-        return (*checked, problems)
-    file_ok, file_detail, known, problems = await asyncio.to_thread(check)
+                problems[mid] = why
+        return (*checked, problems, bad_ids)
+    file_ok, file_detail, known, problems, bad_ids = await asyncio.to_thread(check)
     if not file_ok:
         listed = "; ".join(f"{mid}: {why}" for mid, why in problems.items())
         raise MemoriaError(
-            f"The export file was changed after it was signed ({file_detail}), so nothing "
-            "was restored." + (f" Memories that fail their own check: {listed}." if listed
-                               else " Every memory's own signature checks out, so a memory "
-                                    "may have been added or removed."))
+            f"Nothing was restored: {file_detail}." + (
+                f" Memories that fail their own check: {listed}." if listed
+                else " Every memory's own signature checks out, so a memory may have been "
+                     "added or removed."))
+    leave_out = problems.keys() | bad_ids.keys()  # refused, or listed under not_restored
     same_owner = (from_account, from_agent) == (account, agent_id)
 
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         restored, skipped, stopped = [], [], []
         for number, original in enumerate(export["memories"]):
             original_id = str(original.get("id"))
-            if original_id in problems:
+            if original_id in leave_out:
                 continue
             if db.already_restored(account, original_id):
                 skipped.append(original_id)
@@ -1220,7 +1239,7 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
                     paid = pay()
                 except ValueError as e:  # out of actions: stop here
                     stopped = [m.get("id") for m in export["memories"][number:]
-                               if str(m.get("id")) not in problems
+                               if str(m.get("id")) not in leave_out
                                and not db.already_restored(account, str(m.get("id")))]
                     stopped = [{"memory_id": mid, "why": str(e)} for mid in stopped]
                     break
@@ -1233,12 +1252,22 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
                     refund()
                 stopped = [{"memory_id": m.get("id"), "why": str(e)}
                            for m in export["memories"][number:]
-                           if str(m.get("id")) not in problems
+                           if str(m.get("id")) not in leave_out
                            and not db.already_restored(account, str(m.get("id")))]
                 break
             mem = {field: original[field] for field in EXPORT_FIELDS if field in original}
             mem.update(visibility="private", shared_with=[])  # old shares don't carry over
-            if not (same_owner and db.add_memory({**mem})):
+            if not known:
+                # Signed by an agent that isn't on this server: anyone could have made that
+                # key, so nothing in the file can be trusted to say who wrote it, what its ID
+                # is or when it was written. It gets a new ID, the restore time as its date,
+                # and is marked "unverified origin"; the file's claims are kept as information.
+                mem.update(id=_new_memory_id(), unverified_origin={
+                    "signed_by": exporter, "claimed_memory_id": original_id,
+                    "claimed_created_at": mem.get("created_at"),
+                    "claimed_updated_at": mem.get("updated_at")})
+                mem.update(created_at=_now(), updated_at=None, updated_by=None)
+            if not (same_owner and known and db.add_memory({**mem})):
                 # A copy owned by this agent: re-signed by it (its account and author changed,
                 # or the ID is taken), noting which memory it came from.
                 mem.update(account=account, agent_id=agent_id, restored_from=original_id)
@@ -1261,13 +1290,15 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
             else:  # the very same memory, back where it was: its own signature still holds
                 _mark_changed(mem)
                 db.put_memory(mem)
-            restored.append({"memory_id": mem["id"], "restored_from": original_id})
+            restored.append({"memory_id": mem["id"], "restored_from": original_id,
+                             **({} if known else {"origin": "unverified"})})
         return restored, skipped, stopped
 
     async with _write_lock:
         restored, skipped, stopped = await asyncio.to_thread(in_database)
     _log(who, "restore", restored=len(restored), skipped=len(skipped), refused=len(problems),
-         not_restored=len(stopped), exported_by=exporter)
+         not_restored=len(stopped) + len(bad_ids), exported_by=exporter,
+         **({} if known else {"origin": "unverified"}))
     if restored:
         _kick()  # the background worker adds them to search
     return {
@@ -1275,8 +1306,9 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
         "restored": restored,
         "skipped_already_here": skipped,
         "refused": [{"memory_id": mid, "why": why} for mid, why in problems.items()],
-        "not_restored": stopped,
-        "file_verification": f"verified: {file_detail}",
+        "not_restored": [{"memory_id": mid, "why": why} for mid, why in bad_ids.items()]
+                        + stopped,
+        "file_verification": f"verified: {file_detail}" if known else file_detail,
         "signer_known_here": known,
         "note": ("Restored memories are private to you; share them again with share_memory "
                  "if needed. Outcomes stay in the export file but aren't restored."),
