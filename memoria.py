@@ -815,15 +815,23 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
 
 async def share_memory(agent_id: str, memory_id: str, visibility: str,
                        shared_with: list[str] | None = None, via: str | None = None,
-                       account: str = LOCAL, expires_in_days: int | None = None) -> dict:
+                       account: str = LOCAL, expires_in_days: int | None = None,
+                       remove_expiry: bool = False) -> dict:
     """Change who can read a memory. Only the agent that wrote it may do this.
 
     expires_in_days: the agents it's shared with lose access after this many days (1 to
-    365). Left out, the share never expires. The owner always keeps access.
+    365), counted from now. Left out, the share keeps the expiry it already has (a share
+    that never had one never expires). The owner always keeps access.
+    remove_expiry: True removes the share's expiry on purpose, so it never expires.
     """
     agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     memory_id = _require(memory_id, "memory_id")
     expires_at = _check_expiry(expires_in_days)
+    if not isinstance(remove_expiry, bool):
+        raise MemoriaError("remove_expiry must be true or false.")
+    if remove_expiry and expires_at is not None:
+        raise MemoriaError("Give either expires_in_days (a new expiry) or remove_expiry=true "
+                           "(no expiry), not both.")
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
         if mem is None or not can_see(mem, agent_id, account):
@@ -835,8 +843,14 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
         before = (mem.get("visibility", "private"), mem.get("shared_with", []),
                   mem.get("share_expires_at"))
         mem["visibility"], mem["shared_with"] = _check_sharing(visibility, shared_with, agent_id)
-        # A private memory has no share to end. (Not signed: sharing isn't part of the content.)
-        mem["share_expires_at"] = expires_at if mem["visibility"] == "shared" else None
+        # The expiry only changes when asked to: a new one, or removed on purpose. A private
+        # memory has no share to end. (Not signed: sharing isn't part of the content.)
+        if mem["visibility"] == "private" or remove_expiry:
+            mem["share_expires_at"] = None
+        elif expires_at is not None:
+            mem["share_expires_at"] = expires_at
+        else:
+            mem["share_expires_at"] = before[2]  # kept as it was
         db.put_memory(mem)
         return mem, before
     async with _write_lock:

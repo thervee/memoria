@@ -127,6 +127,7 @@ async def change_sharing(request: Request):
     try:
         data = await _json_body(request)
         author, account = _act_as_author(memory_id)
+        # No expiry is passed, so the memory keeps the share expiry it already has.
         result = await memoria.share_memory(author, memory_id, str(data.get("visibility", "")),
                                             data.get("shared_with") or [], via="dashboard",
                                             account=account)

@@ -95,13 +95,60 @@ def test_a_share_with_no_expiry_works_as_before(store):
     assert bob_sees(mid) == (True, True, True)
 
 
-def test_resharing_without_expiry_or_making_it_private_clears_the_date(store):
+def test_resharing_without_expires_in_days_keeps_the_old_expiry(store):
+    mid, first = save_and_share(expires_in_days=5)
+    again = asyncio.run(m.share_memory("alice", mid, "shared", ["bob", "carol"]))
+    assert again["share_expires_at"] == first["share_expires_at"]  # not wiped
+    assert again["shared_with"] == ["bob", "carol"]
+    assert db.get_memory(mid)["share_expires_at"] == first["share_expires_at"]
+
+
+def test_a_new_expires_in_days_replaces_the_old_expiry(store):
+    mid, first = save_and_share(expires_in_days=5)
+    again = asyncio.run(m.share_memory("alice", mid, "shared", ["bob"], expires_in_days=30))
+    ends = datetime.fromisoformat(again["share_expires_at"])
+    assert ends > datetime.fromisoformat(first["share_expires_at"])
+    assert timedelta(days=30) - timedelta(minutes=1) < ends - datetime.now(timezone.utc)         <= timedelta(days=30)
+
+
+def test_remove_expiry_clears_it_on_purpose(store):
     mid, _ = save_and_share(expires_in_days=5)
+    cleared = asyncio.run(m.share_memory("alice", mid, "shared", ["bob"], remove_expiry=True))
+    assert cleared["share_expires_at"] is None
+    assert db.get_memory(mid).get("share_expires_at") is None
+    # ...and it stays cleared when shared again later without an expiry
     again = asyncio.run(m.share_memory("alice", mid, "shared", ["bob"]))
     assert again["share_expires_at"] is None
-    asyncio.run(m.share_memory("alice", mid, "shared", ["bob"], expires_in_days=5))
-    private = asyncio.run(m.share_memory("alice", mid, "private", expires_in_days=5))
+    assert bob_sees(mid) == (True, True, True)
+
+
+def test_remove_expiry_and_a_new_expiry_together_are_refused(store):
+    mid, first = save_and_share(expires_in_days=5)
+    with pytest.raises(m.MemoriaError, match="not both"):
+        asyncio.run(m.share_memory("alice", mid, "shared", ["bob"], expires_in_days=7,
+                                   remove_expiry=True))
+    assert db.get_memory(mid)["share_expires_at"] == first["share_expires_at"]
+
+
+def test_making_it_private_clears_the_expiry(store):
+    mid, _ = save_and_share(expires_in_days=5)
+    private = asyncio.run(m.share_memory("alice", mid, "private"))
     assert private["share_expires_at"] is None
+
+
+def test_dashboard_sharing_edit_keeps_the_expiry(store):
+    from starlette.testclient import TestClient
+
+    import dashboard
+    mid, first = save_and_share(expires_in_days=5)
+    home = "http://127.0.0.1:8765"
+    with TestClient(dashboard.app, base_url=home) as client:
+        r = client.post(f"/dashboard/api/memories/{mid}/sharing",
+                        headers={"origin": home, "sec-fetch-site": "same-origin"},
+                        json={"visibility": "shared", "shared_with": ["bob", "carol"]})
+    assert r.status_code == 200
+    assert r.json()["share_expires_at"] == first["share_expires_at"]
+    assert db.get_memory(mid)["share_expires_at"] == first["share_expires_at"]
 
 
 @pytest.mark.parametrize("days", [0, 366, -1, 1.5, "7", True])
@@ -123,4 +170,9 @@ def test_expiring_share_over_mcp(memoria_url, devs):
             assert shared["share_expires_at"]
             with pytest.raises(Exception, match="whole number"):
                 await trader.share(saved["memory_id"], "shared", ["analyst"], expires_in_days=400)
+            kept = await trader.share(saved["memory_id"], "shared", ["analyst"])
+            assert kept["share_expires_at"] == shared["share_expires_at"]
+            cleared = await trader.share(saved["memory_id"], "shared", ["analyst"],
+                                         remove_expiry=True)
+            assert cleared["share_expires_at"] is None
     asyncio.run(run())

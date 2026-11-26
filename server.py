@@ -226,12 +226,21 @@ async def _run(action):
         raise ToolError(str(e)) from e
 
 
+WRITING_TOOLS = {"save_memory", "update_memory"}
+
+
 async def _charged(account: str, agent_id: str, tool: str, work):
     """Run a memory action that costs 1 action when billing is on (see billing.py).
 
     The action is taken first, only if the balance is high enough, and given back if
     the work fails. Never charged: billing off, this laptop ("local") and the demo.
     `work` makes the action when called, so nothing runs if the balance is empty.
+
+    Saves and updates are only given back when Memoria refused them (a validation
+    error or Memoria's own error), which always happens before anything is written.
+    Any other failure, a cancelled request included, may come after the write: the
+    database write runs in a worker thread and finishes even if the request is
+    cancelled, so giving the action back then would make the save free.
     """
     try:
         # (database work: in a worker thread, so other requests aren't held up)
@@ -240,8 +249,9 @@ async def _charged(account: str, agent_id: str, tool: str, work):
         raise ToolError(str(e)) from e
     try:
         result = await _run(work())
-    except BaseException:
-        if charged:
+    except BaseException as e:
+        refused = isinstance(e, ToolError)  # (_run turns Memoria's errors into ToolError)
+        if charged and (refused or tool not in WRITING_TOOLS):
             await billing.in_thread(billing.refund, account, agent_id, tool)
         raise
     return await _noted(account, result)
@@ -397,7 +407,8 @@ async def update_memory(memory_id: str, new_note: str, reason: str, ctx: Context
 @mcp.tool()
 async def share_memory(memory_id: str, visibility: str, ctx: Context,
                        shared_with: list[str] | None = None,
-                       expires_in_days: int | None = None) -> dict:
+                       expires_in_days: int | None = None,
+                       remove_expiry: bool = False) -> dict:
     """Change who can read a memory. Only the agent that wrote the memory can do this.
 
     Args:
@@ -406,11 +417,14 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
         shared_with: For shared: the full list of agent IDs allowed to read it. It replaces the old list.
         expires_in_days: Optional, for shared: a whole number from 1 to 365. After that many
             days the agents in shared_with can no longer find, read or list it; you keep full
-            access. Left out, the share never expires. The result shows share_expires_at (UTC).
+            access. Counted from now. Left out, the share keeps the expiry it already has
+            (none: it never expires). The result shows share_expires_at (UTC).
+        remove_expiry: Optional: true removes the share's expiry, so it never expires.
     """
     agent_id, account = _writer(ctx)
     result = await _run(memoria.share_memory(agent_id, memory_id, visibility, shared_with,
-                                             account=account, expires_in_days=expires_in_days))
+                                             account=account, expires_in_days=expires_in_days,
+                                             remove_expiry=remove_expiry))
     if billing.is_billed(account) and result.get("shared_with"):
         result["billing_note"] = (
             "The agents you shared this with spend their own account's actions (this "
