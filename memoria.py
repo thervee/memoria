@@ -54,6 +54,7 @@ from uuid import UUID
 import accounts
 import db
 import identity
+import limits
 from paths import STORE
 
 cognee = None  # Cognee, loaded the first time it's needed: see _engine()
@@ -214,7 +215,7 @@ def _check_sharing(visibility: str, shared_with, owner: str) -> tuple[str, list[
         raise MemoriaError(f"A memory can be shared with {MAX_SHARED_WITH} agents at most.")
     readers = []
     for agent in shared_with or []:
-        agent = agent.strip().lower()
+        agent = _storable(agent, "shared_with").strip().lower()
         if not AGENT_ID_PATTERN.match(agent):
             raise MemoriaError(f"'{agent}' is not a valid agent ID in shared_with.")
         if agent != owner and agent not in readers:
@@ -257,8 +258,19 @@ def _check_expiry(expires_in_days) -> str | None:
     return ends.isoformat()
 
 
+def _storable(value: str, name: str) -> str:
+    """Refuse text that can't be stored as UTF-8 (such as a lone surrogate character),
+    before anything is charged or written, instead of failing halfway through a save."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise MemoriaError(f"{name} contains characters that can't be stored (such as a lone "
+                           "surrogate). Remove them and try again.") from None
+    return value
+
+
 def _require(value: str, name: str) -> str:
-    value = (value or "").strip()
+    value = _storable((value or "").strip(), name)
     if not value:
         raise MemoriaError(f"{name} can't be empty.")
     longest = MAX_LENGTHS.get(name, 10_000)
@@ -320,7 +332,7 @@ def _check_source(source) -> str | None:
         return None
     if not isinstance(source, str):
         raise MemoriaError("source must be text, e.g. a URL, a transaction hash or a file name.")
-    source = " ".join(source.split())  # one line, no stray spaces
+    source = " ".join(_storable(source, "source").split())  # one line, no stray spaces
     if len(source) > MAX_SOURCE:
         raise MemoriaError(f"source can be {MAX_SOURCE} characters at most.")
     return source or None
@@ -408,6 +420,32 @@ def _public(mem: dict) -> dict:
     }
 
 
+async def _locked(work):
+    """Run a change to memories (`work`, in a worker thread) while holding _write_lock.
+
+    The thread is its own task, awaited through asyncio.shield: if the request is
+    cancelled, the lock is still held until the thread has finished writing, and only
+    then is the cancellation passed on. Otherwise a retry sent straight after a cancel
+    could run alongside the first write (making a duplicate, or getting past the
+    account's limits), because a worker thread can't be stopped once it has started.
+    """
+    async with _write_lock:
+        task = asyncio.ensure_future(asyncio.to_thread(work))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():  # (even if cancelled again while waiting)
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+                except BaseException:  # its own error: the cancellation still wins
+                    break
+            if not task.cancelled():
+                task.exception()  # (seen, so asyncio doesn't warn it was never retrieved)
+            raise
+
+
 # ---------- the actions ----------
 
 async def save_memory(agent_id: str, note: str, reason: str, topic: str,
@@ -445,8 +483,7 @@ async def save_memory(agent_id: str, note: str, reason: str, topic: str,
             _sign(mem, who)  # the ID is part of what's signed
         else:
             raise MemoriaError("Could not save the memory just now. Please try again.")
-    async with _write_lock:
-        await asyncio.to_thread(in_database)
+    await _locked(in_database)
     _log(who, "save", memory_id=mem["id"], topic=mem["topic"])
     _kick()
     return _public(mem)
@@ -720,8 +757,7 @@ async def record_outcome(agent_id: str, memory_id: str, result: str, note: str =
         outcome["signature"] = sig
         db.put_outcome(outcome)
         return previous, outcome
-    async with _write_lock:
-        previous, outcome = await asyncio.to_thread(in_database)
+    previous, outcome = await _locked(in_database)
     _log(who, "outcome", memory_id=memory_id, result=result,
          **({"replaced": previous["result"]} if previous else {}))
     outcomes = await asyncio.to_thread(lambda: db.outcomes_for([memory_id]).get(memory_id, []))
@@ -786,8 +822,11 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
     memory_id = _require(memory_id, "memory_id")
     new_note = _require(new_note, "new_note")
     reason = _require(reason, "reason")
+    # Check everything before _use_quota, so a refused update never uses up a daily write.
     if topic:
         topic = _require(topic, "topic")
+    if confidence:
+        confidence = _check_confidence(confidence)
 
     def in_database():  # (run in a worker thread, so other requests aren't held up)
         mem = db.get_memory(memory_id)
@@ -808,7 +847,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         mem["note"] = new_note
         mem["reason"] = reason
         if confidence:
-            mem["confidence"] = _check_confidence(confidence)
+            mem["confidence"] = confidence
         if topic:
             mem["topic"] = topic.strip()
         mem["updated_at"] = _now()
@@ -817,8 +856,7 @@ async def update_memory(agent_id: str, memory_id: str, new_note: str, reason: st
         _mark_changed(mem)  # the background worker updates it in Cognee
         db.put_memory(mem)
         return mem
-    async with _write_lock:
-        mem = await asyncio.to_thread(in_database)
+    mem = await _locked(in_database)
     _log(who, "update", memory_id=memory_id)
     _kick()
     out = _public(mem)
@@ -866,8 +904,7 @@ async def share_memory(agent_id: str, memory_id: str, visibility: str,
             mem["share_expires_at"] = before[2]  # kept as it was
         db.put_memory(mem)
         return mem, before
-    async with _write_lock:
-        mem, before = await asyncio.to_thread(in_database)
+    mem, before = await _locked(in_database)
     _log(identity.principal(account, agent_id), "share", memory_id=memory_id,
          before={"visibility": before[0], "shared_with": before[1],
                  "share_expires_at": before[2]},
@@ -910,8 +947,7 @@ async def delete_memory(agent_id: str, memory_id: str, via: str | None = None,
             if mem.get("data_id"):
                 db.queue_forget(mem["data_id"], mem["dataset_id"], memory_id)
         return mem
-    async with _write_lock:
-        mem = await asyncio.to_thread(in_database)
+    mem = await _locked(in_database)
     _log(identity.principal(account, agent_id), "delete", memory_id=memory_id, topic=mem["topic"],
          **({"via": via} if via else {}))
     _kick()
@@ -1072,18 +1108,30 @@ def all_memories() -> list[dict]:
 EXPORT_FORMAT = "memoria-export-v1"
 # What the export file's signature covers (any other keys in the file are ignored).
 EXPORT_SIGNED_KEYS = ("format", "exported_at", "exported_by", "topic", "memory_count", "memories")
+# An export is split into parts that each fit in one request (limits.MAX_REQUEST_BYTES),
+# each signed on its own and restorable on its own. These say which part of which export
+# it is (signed too; files made before parts existed don't have them).
+PART_KEYS = ("export_id", "part", "parts")
+PART_BYTES = 50_000  # the most one part may take as JSON, leaving room for the request around it
 # Each exported memory: its content, labels, edit history and signature. No sharing
 # settings and nothing internal (Cognee IDs and the like).
 EXPORT_FIELDS = ("id", "account", "agent_id", "created_at", "topic", "confidence", "note",
-                 "reason", "source", "updated_at", "updated_by", "history", "signature")
+                 "reason", "source", "updated_at", "updated_by", "history", "signature",
+                 # Kept so a restored copy stays marked as such: a memory of unverified
+                 # origin must never come back "verified" after an export and a restore.
+                 "restored_from", "unverified_origin")
+ORIGIN_KEYS = ("signed_by", "claimed_memory_id", "claimed_created_at", "claimed_updated_at")
 OUTCOME_EXPORT_FIELDS = ("agent_id", "result", "note", "recorded_at", "signature")
-MAX_RESTORE = 1000  # memories in one export file
+# The most memories one restore request can hold: even the smallest exported memory takes
+# about 430 bytes, so no more than this many fit in a request (limits.MAX_REQUEST_BYTES).
+MAX_RESTORE = 150
 MEMORY_ID_SHAPE = re.compile(r"^mem-[0-9a-f]{8,32}$")  # (older IDs have 8 hex characters)
 
 
 def _export_content(export: dict) -> bytes:
     """The exact bytes an export file's signature covers."""
     content = {key: export.get(key) for key in EXPORT_SIGNED_KEYS}
+    content.update({key: export[key] for key in PART_KEYS if key in export})
     return (EXPORT_FORMAT + "|" + json.dumps(content, sort_keys=True, ensure_ascii=False,
                                              separators=(",", ":"))).encode("utf-8")
 
@@ -1091,7 +1139,12 @@ def _export_content(export: dict) -> bytes:
 async def export_memories(agent_id: str, topic: str | None = None,
                           account: str = LOCAL) -> dict:
     """Every memory this agent wrote (optionally only one topic and those under it), as
-    one signed export file. Memories shared with it by others are never included."""
+    signed export files ("parts"). Memories shared with it by others are never included.
+
+    The memories are split into parts of at most PART_BYTES each, so every part fits in
+    one restore_memories request. Each part is signed on its own, says which part of how
+    many it is, and can be restored on its own.
+    """
     agent_id = await asyncio.to_thread(check_agent, agent_id, account)
     topic = (topic or "").strip() or None
     who = identity.principal(account, agent_id)
@@ -1106,15 +1159,42 @@ async def export_memories(agent_id: str, topic: str | None = None,
                               for o in outcomes.get(mem["id"], [])]}
                 for mem in mine]
     memories = await asyncio.to_thread(in_database)
-    export = {"format": EXPORT_FORMAT, "exported_at": _now(),
-              "exported_by": {"account": account, "agent_id": agent_id},
-              "topic": topic, "memory_count": len(memories), "memories": memories}
-    try:
-        export["signature"] = identity.sign(who, _export_content(export))
-    except identity.IdentityError as e:
-        raise MemoriaError(str(e)) from e
-    _log(who, "export", memories=len(memories), **({"topic": topic} if topic else {}))
-    return export
+    export_id, exported_at = "exp-" + secrets.token_hex(8), _now()
+
+    def make_part(number: int, total: int, some: list) -> dict:
+        part = {"format": EXPORT_FORMAT, "exported_at": exported_at,
+                "exported_by": {"account": account, "agent_id": agent_id}, "topic": topic,
+                "export_id": export_id, "part": number, "parts": total,
+                "memory_count": len(some), "memories": some}
+        try:
+            part["signature"] = identity.sign(who, _export_content(part))
+        except identity.IdentityError as e:
+            raise MemoriaError(str(e)) from e
+        return part
+
+    # Group the memories so each part stays under PART_BYTES (measured as plain-ASCII
+    # JSON, the largest form it can take in a request). A part always holds at least one.
+    room = PART_BYTES - _json_size(make_part(9999, 9999, []))
+    groups, size = [[]], 0
+    for mem in memories:
+        mem_size = _json_size(mem) + 2
+        if groups[-1] and (size + mem_size > room or len(groups[-1]) >= MAX_RESTORE):
+            groups.append([])
+            size = 0
+        groups[-1].append(mem)
+        size += mem_size
+    parts = [make_part(number, len(groups), some) for number, some in enumerate(groups, 1)]
+    _log(who, "export", memories=len(memories), parts=len(parts),
+         **({"topic": topic} if topic else {}))
+    return {"export_id": export_id, "exported_at": exported_at, "memory_count": len(memories),
+            "part_count": len(parts), "parts": parts,
+            "how_to_restore": ("Keep every part. Restore each part with restore_memories "
+                               "(one part per call); each part is signed and restores on "
+                               "its own, and restoring a part twice adds nothing.")}
+
+
+def _json_size(data) -> int:
+    return len(json.dumps(data, ensure_ascii=True, separators=(",", ":")))
 
 
 def _read_export(export) -> dict:
@@ -1133,8 +1213,9 @@ def _read_export(export) -> dict:
             or not all(isinstance(mem, dict) for mem in memories)):
         raise MemoriaError("The export file is incomplete: it needs exported_by and memories.")
     if len(memories) > MAX_RESTORE:
-        raise MemoriaError(f"An export file can hold {MAX_RESTORE:,} memories at most. "
-                           "Export one topic at a time to make smaller files.")
+        raise MemoriaError(f"One restore can take {MAX_RESTORE} memories at most (a request "
+                           f"can be {limits.MAX_REQUEST_BYTES:,} bytes at most). Restore each "
+                           "part of an export (from export_memories) with its own call.")
     return export
 
 
@@ -1144,6 +1225,21 @@ def _check_exported_memory(mem: dict, account: str, agent: str) -> str | None:
         return "it wasn't written by the agent that made the export"
     if (mem.get("updated_by") or agent) != agent:
         return "its latest version wasn't signed by its author"
+    restored_from = mem.get("restored_from")
+    if restored_from is not None and (not isinstance(restored_from, str)
+                                      or not MEMORY_ID_SHAPE.match(restored_from)):
+        return "its restored_from isn't a valid memory ID"
+    origin = mem.get("unverified_origin")
+    if origin is not None and (
+            not isinstance(origin, dict) or not isinstance(origin.get("signed_by"), str)
+            or not set(origin) <= set(ORIGIN_KEYS)
+            or not all(value is None or (isinstance(value, str) and len(value) <= 200)
+                       for value in origin.values())):
+        return "its unverified_origin isn't valid"
+    try:  # (any text in it, its history included, must be storable)
+        json.dumps(mem, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, TypeError, ValueError):
+        return "it contains characters that can't be stored"
     signer = identity.principal(account, agent)
     ok, detail, _ = identity.verify_anywhere(_signed_content(mem), mem.get("signature"), signer)
     if not ok:
@@ -1178,6 +1274,39 @@ def _when(text) -> None:
 
 async def restore_memories(agent_id: str, export, account: str = LOCAL,
                            pay=None, refund=None) -> dict:
+    """Restore one part of an export, or (if it fits in the request) a whole export as
+    export_memories returned it, part by part. See _restore_part."""
+    if isinstance(export, str):
+        try:
+            export = json.loads(export)
+        except ValueError:
+            raise MemoriaError("The export file isn't valid JSON.") from None
+    if not (isinstance(export, dict) and "parts" in export and "format" not in export):
+        return await _restore_part(agent_id, export, account, pay, refund)
+    parts = export["parts"]
+    if not isinstance(parts, list) or not parts:
+        raise MemoriaError("The export has no parts to restore.")
+    results = []
+    for number, part in enumerate(parts, 1):
+        try:
+            results.append(await _restore_part(agent_id, part, account, pay, refund))
+        except MemoriaError as e:
+            raise MemoriaError(f"Part {number} of {len(parts)}: {e}"
+                               + (" The parts before it were restored." if results else "")
+                               ) from None
+    merged = {"restored_count": sum(r["restored_count"] for r in results)}
+    for key in ("restored", "skipped_already_here", "refused", "not_restored"):
+        merged[key] = [item for r in results for item in r[key]]
+    merged["file_verification"] = "; ".join(dict.fromkeys(r["file_verification"]
+                                                          for r in results))
+    merged["signer_known_here"] = all(r["signer_known_here"] for r in results)
+    merged["parts_restored"] = len(results)
+    merged["note"] = results[0]["note"]
+    return merged
+
+
+async def _restore_part(agent_id: str, export, account: str = LOCAL,
+                        pay=None, refund=None) -> dict:
     """Load an export file's memories into this agent's account, as this agent's own.
 
     The file's signature and every memory's signature are checked first. A file that
@@ -1294,8 +1423,7 @@ async def restore_memories(agent_id: str, export, account: str = LOCAL,
                              **({} if known else {"origin": "unverified"})})
         return restored, skipped, stopped
 
-    async with _write_lock:
-        restored, skipped, stopped = await asyncio.to_thread(in_database)
+    restored, skipped, stopped = await _locked(in_database)
     _log(who, "restore", restored=len(restored), skipped=len(skipped), refused=len(problems),
          not_restored=len(stopped) + len(bad_ids), exported_by=exporter,
          **({} if known else {"origin": "unverified"}))

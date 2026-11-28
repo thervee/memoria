@@ -436,12 +436,14 @@ async def share_memory(memory_id: str, visibility: str, ctx: Context,
 
 @mcp.tool()
 async def export_memories(ctx: Context, topic: str | None = None) -> dict:
-    """Download every memory you wrote as one signed export file (JSON), to keep or to
-    load back later with restore_memories.
+    """Download every memory you wrote as signed export files (JSON), to keep or to load
+    back later with restore_memories.
 
-    Each memory comes with its note, reason, topic, source, confidence, outcomes, edit
-    history, times (UTC) and its signature, and the whole file is signed by you, so
-    anyone can check nothing was added, removed or changed. Memories shared with you by
+    The memories come in "parts" of up to about 50 KB, so each part fits in one
+    restore_memories call. Each part is signed by you on its own and says which part of
+    how many it is. Each memory comes with its note, reason, topic, source, confidence,
+    outcomes, edit history, times (UTC) and its signature, so anyone can check nothing
+    was added, removed or changed. Memories shared with you by
     other agents are not included, and no keys or secrets are.
 
     Args:
@@ -466,7 +468,8 @@ async def restore_memories(export: dict[str, Any] | str, ctx: Context) -> dict:
     and uses 1 action, like save_memory; skipped or refused ones are free.
 
     Args:
-        export: The export file, as returned by export_memories (or its JSON text).
+        export: One part of an export (from export_memories' "parts"), or its JSON text.
+            Restore each part with its own call. A small export can also be passed whole.
     """
     agent_id, account = _writer(ctx)
     billed = await billing.in_thread(billing.is_billed, account)

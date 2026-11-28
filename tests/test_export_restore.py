@@ -16,6 +16,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def one_part(export_coro):
+    """An export small enough to be one part: that part (a signed export file)."""
+    export = run(export_coro)
+    assert export["part_count"] == 1 and len(export["parts"]) == 1
+    return export["parts"][0]
+
+
 def save(agent, note, topic="customers", account=m.LOCAL, **kw):
     return run(m.save_memory(agent, note, "From the contract.", topic, account=account,
                              **kw))["memory_id"]
@@ -42,7 +49,7 @@ def alices(store):
 
 
 def test_export_includes_only_your_own_memories(alices):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     assert {mem["id"] for mem in export["memories"]} == {alices["acme"], alices["globex"],
                                                          alices["gas"]}  # not bob's
     assert export["memory_count"] == 3 and export["exported_by"] == {
@@ -60,12 +67,12 @@ def test_export_includes_only_your_own_memories(alices):
     assert export["signature"]["signed_by"] == "alice"
     assert set(export["signature"]) == {"algorithm", "signed_by", "public_key", "signature"}
     # Only one topic (and the topics under it):
-    some = run(m.export_memories("alice", topic="customers"))
+    some = one_part(m.export_memories("alice", topic="customers"))
     assert {mem["id"] for mem in some["memories"]} == {alices["acme"], alices["globex"]}
 
 
 def test_a_changed_file_is_refused_and_says_which_memory(alices):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     for mid in list(mine()):
         run(m.delete_memory("alice", mid))
 
@@ -91,7 +98,7 @@ def test_a_changed_file_is_refused_and_says_which_memory(alices):
 
 
 def test_restoring_twice_saves_nothing_new(alices):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     for mid in list(mine()):
         run(m.delete_memory("alice", mid))
 
@@ -112,7 +119,7 @@ def test_restoring_twice_saves_nothing_new(alices):
 def test_restoring_into_another_account_twice_makes_no_duplicates(on):
     for note in ("One.", "Two."):
         save("trader", note, account="acme")
-    export = run(m.export_memories("trader", account="acme"))
+    export = one_part(m.export_memories("trader", account="acme"))
 
     first = run(m.restore_memories("analyst", export, account="globex"))
     assert first["restored_count"] == 2 and first["file_verification"].startswith("verified")
@@ -129,7 +136,7 @@ def test_restoring_into_another_account_twice_makes_no_duplicates(on):
 def test_restore_respects_the_account_limit(on, monkeypatch):
     for note in ("One.", "Two.", "Three."):
         save("trader", note, account="acme")
-    export = run(m.export_memories("trader", account="acme"))
+    export = one_part(m.export_memories("trader", account="acme"))
     real = accounts.limits
     monkeypatch.setattr(accounts, "limits", lambda account: (
         {**real(account), "max_memories": 2} if account == "globex" else real(account)))
@@ -141,7 +148,7 @@ def test_restore_respects_the_account_limit(on, monkeypatch):
 
 
 def test_shares_do_not_carry_over(alices):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     run(m.delete_memory("alice", alices["gas"]))
     run(m.restore_memories("alice", export))
     back = db.get_memory(alices["gas"])
@@ -156,7 +163,7 @@ def test_restore_charges_one_action_per_memory_restored(on):
     import server
     for note in ("One.", "Two.", "Three."):
         save("trader", note, account="acme")
-    export = run(m.export_memories("trader", account="acme"))
+    export = one_part(m.export_memories("trader", account="acme"))
     start = billing.balance("globex")["actions"]
 
     class Ctx:  # what MCP hands the tool: the caller, as proven by its key
@@ -174,7 +181,7 @@ def test_export_and_restore_over_mcp(memoria_url, devs):
         async with Memoria(api_key=devs["acme/trader"], url=memoria_url) as trader:
             saved = await trader.save("Acme renews March 1.", reason="email", topic="customers")
             export = await trader.export()
-            assert [mem["id"] for mem in export["memories"]] == [saved["memory_id"]]
+            assert [mem["id"] for mem in export["parts"][0]["memories"]] == [saved["memory_id"]]
             await trader.delete(saved["memory_id"])
             back = await trader.restore(export)
             assert back["restored_count"] == 1
@@ -247,7 +254,7 @@ def test_a_changed_file_from_an_unknown_signer_is_still_refused(store):
 @pytest.mark.parametrize("bad_id", ["mem-" + "a" * 500, "mem-12", "mem-ABCDEF12",
                                     "mem-xyz12345", "memo-12345678"])
 def test_memory_ids_must_have_the_normal_shape(alices, bad_id):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     for mid in list(mine()):
         run(m.delete_memory("alice", mid))
     bad = export["memories"][0]
@@ -263,7 +270,7 @@ def test_memory_ids_must_have_the_normal_shape(alices, bad_id):
 
 
 def test_the_file_level_message_says_the_file_was_changed(alices):
-    export = run(m.export_memories("alice"))
+    export = one_part(m.export_memories("alice"))
     export["memories"].pop()  # every memory still checks out; the file doesn't
     with pytest.raises(m.MemoriaError) as refused:
         run(m.restore_memories("alice", export))
